@@ -1,0 +1,6 @@
+markets:
+  us:
+    timezone: America/New_York
+    currency: USD
+    defaultSource: stooq
+    enabled: true

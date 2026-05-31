@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Symbol Universe",
+  "type": "object",
+  "required": ["date", "source", "symbols"],
+  "properties": {
+    "date": { "type": "string", "format": "date" },
+    "market": { "type": "string" },
+    "source": { "type": "string" },
+    "symbols": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["symbol", "name", "exchange", "assetType", "isEtf", "isActive"],
+        "properties": {
+          "symbol": { "type": "string" },
+          "name": { "type": "string" },
+          "exchange": { "type": "string" },
+          "assetType": { "type": "string" },
+          "isEtf": { "type": "boolean" },
+          "isActive": { "type": "boolean" }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,12 @@
+name = "market-data-hub"
+main = "src/index.ts"
+compatibility_date = "2026-05-31"
+
+[[r2_buckets]]
+binding = "MARKET_DATA"
+bucket_name = "market-data"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "market-data"
+database_id = "005fd10a-8c63-477b-8aff-174183179dc4"

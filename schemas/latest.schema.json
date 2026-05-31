@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Latest Quotes",
+  "type": "object",
+  "required": ["market", "asOf", "schemaVersion", "quotes"],
+  "properties": {
+    "market": { "type": "string" },
+    "asOf": { "type": "string", "format": "date" },
+    "schemaVersion": { "const": 1 },
+    "quotes": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["price", "change", "changePct", "volume", "open", "high", "low", "prevClose"],
+        "properties": {
+          "price": { "type": "number" },
+          "change": { "type": "number" },
+          "changePct": { "type": "number" },
+          "volume": { "type": "integer" },
+          "open": { "type": "number" },
+          "high": { "type": "number" },
+          "low": { "type": "number" },
+          "prevClose": { "type": "number" }
+        }
+      }
+    }
+  }
+}

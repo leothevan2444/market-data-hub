@@ -1,0 +1,293 @@
+package service
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"slices"
+	"strings"
+	"time"
+
+	"market-data-hub/internal/normalize"
+	"market-data-hub/internal/schema"
+	"market-data-hub/internal/source/nasdaqtrader"
+	"market-data-hub/internal/source/stooq"
+	"market-data-hub/internal/storage"
+	"market-data-hub/internal/storage/d1"
+	"market-data-hub/internal/storage/local"
+	"market-data-hub/internal/storage/r2"
+)
+
+type SyncOptions struct {
+	Market        string
+	Date          string
+	WatchlistPath string
+	Limit         int
+}
+
+type Syncer struct {
+	Store   storage.ObjectStore
+	D1      d1.Client
+	Symbols interface {
+		FetchUniverse(context.Context) ([]schema.SymbolInfo, error)
+	}
+	Quotes interface {
+		FetchDaily(context.Context, string, string) (schema.DailyQuoteRecord, error)
+	}
+	Clock func() time.Time
+}
+
+func NewSyncer(store storage.ObjectStore, d1Client d1.Client) Syncer {
+	return Syncer{
+		Store:   store,
+		D1:      d1Client,
+		Symbols: nasdaqtrader.New(),
+		Quotes:  stooq.New(),
+		Clock:   func() time.Time { return time.Now().UTC() },
+	}
+}
+
+func (s Syncer) Run(ctx context.Context, opt SyncOptions) error {
+	if opt.Market == "" {
+		opt.Market = "us"
+	}
+	if opt.Date == "" {
+		opt.Date = s.now().Format("2006-01-02")
+	}
+	if err := normalize.RequireDate(opt.Date); err != nil {
+		return err
+	}
+	run := schema.IngestionRun{
+		ID:        opt.Market + "-" + opt.Date + "-" + s.now().Format("150405"),
+		Market:    strings.ToUpper(opt.Market),
+		Date:      opt.Date,
+		Status:    "running",
+		Source:    "stooq",
+		StartedAt: s.now().Format(time.RFC3339),
+	}
+	finish := func(status string, err error) error {
+		run.Status = status
+		run.FinishedAt = s.now().Format(time.RFC3339)
+		if err != nil {
+			run.ErrorMessage = err.Error()
+		}
+		_ = s.writeRun(ctx, opt.Date, run)
+		_ = s.writeRunD1(ctx, run)
+		return err
+	}
+
+	symbols, err := s.Symbols.FetchUniverse(ctx)
+	if err != nil {
+		return finish("failed", fmt.Errorf("fetch universe: %w", err))
+	}
+	universe := schema.SymbolUniverse{Date: opt.Date, Market: strings.ToUpper(opt.Market), Source: "nasdaqtrader", Symbols: symbols}
+	if err := s.writeJSON(ctx, storage.SymbolsLatestKey(opt.Market), universe); err != nil {
+		return finish("failed", err)
+	}
+	if err := s.writeJSON(ctx, storage.SymbolsDatedKey(opt.Market, opt.Date), universe); err != nil {
+		return finish("failed", err)
+	}
+	_ = s.writeSymbolsD1(ctx, opt.Market, symbols)
+
+	targets, err := LoadWatchlist(opt.WatchlistPath)
+	if err != nil {
+		return finish("failed", err)
+	}
+	if len(targets) == 0 {
+		for _, sym := range symbols {
+			if sym.IsActive {
+				targets = append(targets, sym.Symbol)
+			}
+		}
+	}
+	if opt.Limit > 0 && len(targets) > opt.Limit {
+		targets = targets[:opt.Limit]
+	}
+	run.RecordsTotal = len(targets)
+
+	previous := s.readLatest(ctx, opt.Market)
+	universeMap := normalize.UniverseMap(symbols)
+	var records []schema.DailyQuoteRecord
+	var failedTargets []string
+	for _, symbol := range targets {
+		record, err := s.Quotes.FetchDaily(ctx, symbol, opt.Date)
+		if err != nil {
+			run.RecordsFailed++
+			run.FailedSymbols = append(run.FailedSymbols, symbol+":"+err.Error())
+			failedTargets = append(failedTargets, strings.ToUpper(symbol))
+			continue
+		}
+		result := normalize.ValidateQuote(record, universeMap)
+		record.Flags = append(record.Flags, result.Flags...)
+		if !result.Valid {
+			run.RecordsFailed++
+			run.FailedSymbols = append(run.FailedSymbols, symbol+":"+strings.Join(result.Problems, ","))
+			failedTargets = append(failedTargets, strings.ToUpper(symbol))
+			continue
+		}
+		records = append(records, record)
+	}
+	run.RecordsSuccess = len(records)
+	if len(records) == 0 {
+		return finish("failed", fmt.Errorf("no valid records synced"))
+	}
+	slices.SortFunc(records, func(a, b schema.DailyQuoteRecord) int { return strings.Compare(a.Symbol, b.Symbol) })
+	daily := schema.DailyMarketFile{Market: strings.ToUpper(opt.Market), Date: opt.Date, Type: "eod", Source: []string{"stooq"}, Count: len(records), SchemaVersion: 1, Records: records}
+	dailyKey := storage.DailyKey(opt.Market, opt.Date)
+	if exists, _ := s.Store.Exists(ctx, dailyKey); exists {
+		return finish("failed", fmt.Errorf("%s already exists; use rebuild-history to replace derived history/latest", dailyKey))
+	}
+	if err := s.writeGzipJSON(ctx, dailyKey, daily); err != nil {
+		return finish("failed", err)
+	}
+
+	latest := normalize.BuildLatest(opt.Market, opt.Date, records, previous)
+	for _, symbol := range failedTargets {
+		if previous.Quotes == nil {
+			continue
+		}
+		if quote, ok := previous.Quotes[symbol]; ok {
+			quote.Stale = true
+			latest.Quotes[symbol] = quote
+		}
+	}
+	if err := s.writeJSON(ctx, storage.LatestKey(opt.Market), latest); err != nil {
+		return finish("failed", err)
+	}
+	if err := s.writeJSON(ctx, storage.LatestMinKey(opt.Market), normalize.BuildLatestMin(latest)); err != nil {
+		return finish("failed", err)
+	}
+	if err := s.updateHistories(ctx, opt.Market, records); err != nil {
+		return finish("failed", err)
+	}
+	_ = s.writeLatestD1(ctx, opt.Market, latest)
+	if run.RecordsFailed > 0 {
+		return finish("partial", nil)
+	}
+	return finish("success", nil)
+}
+
+func (s Syncer) updateHistories(ctx context.Context, market string, records []schema.DailyQuoteRecord) error {
+	for _, r := range records {
+		key := storage.HistoryKey(market, r.Symbol)
+		history := schema.SymbolHistory{Symbol: r.Symbol, Market: strings.ToUpper(market), SchemaVersion: 1}
+		if raw, err := s.Store.Get(ctx, key); err == nil {
+			_ = storage.UnmarshalMaybeGzip(raw, &history)
+		}
+		replaced := false
+		for i := range history.Records {
+			if history.Records[i].Date == r.Date {
+				history.Records[i] = r
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			history.Records = append(history.Records, r)
+		}
+		slices.SortFunc(history.Records, func(a, b schema.DailyQuoteRecord) int { return strings.Compare(a.Date, b.Date) })
+		if err := s.writeGzipJSON(ctx, key, history); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s Syncer) readLatest(ctx context.Context, market string) schema.LatestFull {
+	var latest schema.LatestFull
+	if raw, err := s.Store.Get(ctx, storage.LatestKey(market)); err == nil {
+		_ = json.Unmarshal(raw, &latest)
+	}
+	return latest
+}
+
+func (s Syncer) writeJSON(ctx context.Context, key string, v any) error {
+	raw, err := storage.MarshalJSON(v)
+	if err != nil {
+		return err
+	}
+	return s.Store.Put(ctx, key, raw, "application/json")
+}
+
+func (s Syncer) writeGzipJSON(ctx context.Context, key string, v any) error {
+	raw, err := storage.MarshalGzipJSON(v)
+	if err != nil {
+		return err
+	}
+	return s.Store.Put(ctx, key, raw, "application/json")
+}
+
+func (s Syncer) writeRun(ctx context.Context, date string, run schema.IngestionRun) error {
+	raw, err := storage.MarshalJSON(run)
+	if err != nil {
+		return err
+	}
+	return s.Store.Put(ctx, storage.RunKey(date), raw, "application/json")
+}
+
+func (s Syncer) writeSymbolsD1(ctx context.Context, market string, symbols []schema.SymbolInfo) error {
+	const chunkSize = 100
+	statements := make([]d1.Statement, 0, chunkSize)
+	for _, sym := range symbols {
+		statements = append(statements, d1.Statement{
+			SQL:    `INSERT OR REPLACE INTO symbols (symbol, name, market, exchange, asset_type, is_etf, is_active, first_seen, last_seen, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT first_seen FROM symbols WHERE symbol = ?), date('now')), date('now'), datetime('now'))`,
+			Params: []any{sym.Symbol, sym.Name, strings.ToUpper(market), sym.Exchange, sym.AssetType, boolInt(sym.IsEtf), boolInt(sym.IsActive), sym.Symbol},
+		})
+		if len(statements) == chunkSize {
+			if err := s.D1.ExecBatch(ctx, statements); err != nil {
+				return err
+			}
+			statements = statements[:0]
+		}
+	}
+	return s.D1.ExecBatch(ctx, statements)
+}
+
+func (s Syncer) writeLatestD1(ctx context.Context, market string, latest schema.LatestFull) error {
+	statements := make([]d1.Statement, 0, len(latest.Quotes))
+	for symbol, q := range latest.Quotes {
+		statements = append(statements, d1.Statement{
+			SQL:    `INSERT OR REPLACE INTO latest_quotes (symbol, market, date, open, high, low, close, adj_close, volume, change, change_pct, source, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`,
+			Params: []any{symbol, strings.ToUpper(market), latest.AsOf, q.Open, q.High, q.Low, q.Price, q.Price, q.Volume, q.Change, q.ChangePct, q.Source},
+		})
+	}
+	return s.D1.ExecBatch(ctx, statements)
+}
+
+func (s Syncer) writeRunD1(ctx context.Context, run schema.IngestionRun) error {
+	return s.D1.Exec(ctx, `INSERT OR REPLACE INTO ingestion_runs (id, market, date, status, source, records_total, records_success, records_failed, started_at, finished_at, error_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		run.ID, run.Market, run.Date, run.Status, run.Source, run.RecordsTotal, run.RecordsSuccess, run.RecordsFailed, run.StartedAt, run.FinishedAt, run.ErrorMessage)
+}
+
+func (s Syncer) now() time.Time {
+	if s.Clock != nil {
+		return s.Clock()
+	}
+	return time.Now().UTC()
+}
+
+func boolInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
+}
+
+func StorageFor(name, root string) (storage.ObjectStore, error) {
+	switch name {
+	case "", "local":
+		return localStore(root), nil
+	case "r2":
+		return r2Store(), nil
+	default:
+		return nil, fmt.Errorf("unknown storage %q", name)
+	}
+}
+
+var localStore = func(root string) storage.ObjectStore {
+	return local.New(root)
+}
+
+var r2Store = func() storage.ObjectStore {
+	return r2.FromEnv()
+}

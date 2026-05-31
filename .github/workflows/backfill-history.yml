@@ -1,0 +1,66 @@
+name: Backfill Market History
+
+on:
+  workflow_dispatch:
+    inputs:
+      from:
+        description: "Start date, YYYY-MM-DD"
+        required: true
+        type: string
+      to:
+        description: "End date, YYYY-MM-DD"
+        required: true
+        type: string
+      symbols:
+        description: "Comma-separated symbols. Empty uses config/watchlist.yaml unless all=true."
+        required: false
+        type: string
+      all:
+        description: "Backfill all active US universe symbols"
+        required: false
+        type: boolean
+        default: false
+      replace:
+        description: "Replace target records inside the date range instead of merging"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: market-data-backfill-us
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Test
+        run: go test ./...
+
+      - name: Run backfill
+        env:
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          STOOQ_API_KEY: ${{ secrets.STOOQ_API_KEY }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+        run: |
+          ARGS=(--storage r2 --market us --from "${{ inputs.from }}" --to "${{ inputs.to }}")
+          if [ -n "${{ inputs.symbols }}" ]; then
+            ARGS+=(--symbols "${{ inputs.symbols }}")
+          fi
+          if [ "${{ inputs.all }}" = "true" ]; then
+            ARGS+=(--all)
+          fi
+          if [ "${{ inputs.replace }}" = "true" ]; then
+            ARGS+=(--replace)
+          fi
+          go run ./cmd/backfill-history "${ARGS[@]}"

@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Daily Market File",
+  "type": "object",
+  "required": ["market", "date", "type", "source", "count", "schemaVersion", "records"],
+  "properties": {
+    "market": { "type": "string" },
+    "date": { "type": "string", "format": "date" },
+    "type": { "const": "eod" },
+    "source": { "type": "array", "items": { "type": "string" } },
+    "count": { "type": "integer", "minimum": 0 },
+    "schemaVersion": { "const": 1 },
+    "records": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["symbol", "open", "high", "low", "close", "adjClose", "volume"],
+        "properties": {
+          "symbol": { "type": "string" },
+          "date": { "type": "string", "format": "date" },
+          "open": { "type": "number" },
+          "high": { "type": "number" },
+          "low": { "type": "number" },
+          "close": { "type": "number" },
+          "adjClose": { "type": "number" },
+          "volume": { "type": "integer" },
+          "source": { "type": "string" },
+          "updatedAt": { "type": "string" }
+        }
+      }
+    }
+  }
+}
