@@ -42,6 +42,24 @@ Use explicit symbols instead of the watchlist:
 go run ./cmd/backfill-history --storage r2 --market us --symbols NVDA,AAPL,MSFT --from 2024-01-01 --to 2024-12-31
 ```
 
+For large runs, split the universe into batches and throttle Stooq requests:
+
+```bash
+go run ./cmd/backfill-history \
+  --storage r2 \
+  --market us \
+  --all \
+  --from 2010-01-01 \
+  --to 2026-05-29 \
+  --offset 0 \
+  --batch-size 200 \
+  --sleep-ms 1000 \
+  --max-retries 3 \
+  --retry-backoff-ms 2000
+```
+
+`--symbols-file` accepts newline or comma-separated symbol lists. Explicit `--symbols` wins over `--symbols-file`; `--symbols-file` wins over `--all`; `--all` wins over the default watchlist.
+
 By default, backfill merges fetched records into existing objects. Add `--replace` to replace target symbol records inside the requested date range while preserving other symbols and dates outside the range.
 
 ## Cloudflare Setup
@@ -59,7 +77,7 @@ Apply the D1 migration in `worker/migrations/0001_initial.sql`, then set `worker
 GitHub Actions:
 
 - `Sync Market Data` runs daily and supports manual one-day sync.
-- `Backfill Market History` is manual only and supports `from`, `to`, `symbols`, `all`, and `replace` inputs.
+- `Backfill Market History` is manual only and supports `from`, `to`, `symbols`, `symbols_file`, `all`, `replace`, `offset`, `batch_size`, `sleep_ms`, `max_retries`, and `retry_backoff_ms` inputs.
 
 ## Worker
 

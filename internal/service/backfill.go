@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -24,9 +25,15 @@ type BackfillOptions struct {
 	From          string
 	To            string
 	Symbols       []string
+	SymbolsFile   string
 	WatchlistPath string
 	All           bool
 	Replace       bool
+	Offset        int
+	BatchSize     int
+	Sleep         time.Duration
+	MaxRetries    int
+	RetryBackoff  time.Duration
 }
 
 type Backfiller struct {
@@ -99,6 +106,7 @@ func (b Backfiller) Run(ctx context.Context, opt BackfillOptions) error {
 	if err != nil {
 		return finish("failed", err)
 	}
+	targets = sliceBackfillTargets(targets, opt.Offset, opt.BatchSize)
 	run.RecordsTotal = len(targets)
 	if len(targets) == 0 {
 		return finish("failed", fmt.Errorf("no backfill targets resolved"))
@@ -107,8 +115,13 @@ func (b Backfiller) Run(ctx context.Context, opt BackfillOptions) error {
 	universeMap := normalize.UniverseMap(universe)
 	bySymbol := map[string][]schema.DailyQuoteRecord{}
 	byDate := map[string][]schema.DailyQuoteRecord{}
-	for _, symbol := range targets {
-		records, err := b.Quotes.FetchHistory(ctx, symbol)
+	for i, symbol := range targets {
+		if opt.Sleep > 0 && i > 0 {
+			if err := sleepContext(ctx, opt.Sleep); err != nil {
+				return finish("failed", err)
+			}
+		}
+		records, err := b.fetchHistoryWithRetry(ctx, symbol, opt.MaxRetries, opt.RetryBackoff)
 		if err != nil {
 			run.RecordsFailed++
 			run.FailedSymbols = append(run.FailedSymbols, symbol+":"+err.Error())
@@ -169,6 +182,15 @@ func resolveBackfillTargets(opt BackfillOptions, universe []schema.SymbolInfo) (
 	for _, symbol := range opt.Symbols {
 		add(symbol, &targets)
 	}
+	if len(targets) == 0 && opt.SymbolsFile != "" {
+		fileSymbols, err := LoadSymbolList(opt.SymbolsFile)
+		if err != nil {
+			return nil, err
+		}
+		for _, symbol := range fileSymbols {
+			add(symbol, &targets)
+		}
+	}
 	if len(targets) == 0 && opt.All {
 		for _, symbol := range universe {
 			if symbol.IsActive {
@@ -186,6 +208,80 @@ func resolveBackfillTargets(opt BackfillOptions, universe []schema.SymbolInfo) (
 		}
 	}
 	return targets, nil
+}
+
+func LoadSymbolList(path string) ([]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	var symbols []string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		for _, part := range strings.Split(line, ",") {
+			part = strings.TrimSpace(part)
+			if part != "" {
+				symbols = append(symbols, strings.ToUpper(part))
+			}
+		}
+	}
+	return symbols, scanner.Err()
+}
+
+func sliceBackfillTargets(targets []string, offset, batchSize int) []string {
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= len(targets) {
+		return nil
+	}
+	targets = targets[offset:]
+	if batchSize > 0 && batchSize < len(targets) {
+		return targets[:batchSize]
+	}
+	return targets
+}
+
+func (b Backfiller) fetchHistoryWithRetry(ctx context.Context, symbol string, maxRetries int, backoff time.Duration) ([]schema.DailyQuoteRecord, error) {
+	if maxRetries < 0 {
+		maxRetries = 0
+	}
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		records, err := b.Quotes.FetchHistory(ctx, symbol)
+		if err == nil {
+			return records, nil
+		}
+		lastErr = err
+		if attempt == maxRetries {
+			break
+		}
+		delay := backoff
+		if delay <= 0 {
+			delay = time.Second
+		}
+		delay *= time.Duration(attempt + 1)
+		if err := sleepContext(ctx, delay); err != nil {
+			return nil, err
+		}
+	}
+	return nil, lastErr
+}
+
+func sleepContext(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func filterBackfillRecords(records []schema.DailyQuoteRecord, start, end time.Time, universe map[string]schema.SymbolInfo) ([]schema.DailyQuoteRecord, []string) {

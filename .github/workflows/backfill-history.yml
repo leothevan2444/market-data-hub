@@ -15,6 +15,10 @@ on:
         description: "Comma-separated symbols. Empty uses config/watchlist.yaml unless all=true."
         required: false
         type: string
+      symbols_file:
+        description: "Path to a symbol list file in the repo. Used only when symbols is empty."
+        required: false
+        type: string
       all:
         description: "Backfill all active US universe symbols"
         required: false
@@ -25,6 +29,31 @@ on:
         required: false
         type: boolean
         default: false
+      offset:
+        description: "Number of resolved symbols to skip"
+        required: false
+        type: string
+        default: "0"
+      batch_size:
+        description: "Maximum symbols to process in this run. 0 means all resolved symbols."
+        required: false
+        type: string
+        default: "200"
+      sleep_ms:
+        description: "Delay between Stooq symbol requests in milliseconds"
+        required: false
+        type: string
+        default: "1000"
+      max_retries:
+        description: "Retry attempts per symbol after the first request"
+        required: false
+        type: string
+        default: "3"
+      retry_backoff_ms:
+        description: "Linear retry backoff base in milliseconds"
+        required: false
+        type: string
+        default: "2000"
 
 concurrency:
   group: market-data-backfill-us
@@ -53,9 +82,21 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
         run: |
-          ARGS=(--storage r2 --market us --from "${{ inputs.from }}" --to "${{ inputs.to }}")
+          ARGS=(
+            --storage r2
+            --market us
+            --from "${{ inputs.from }}"
+            --to "${{ inputs.to }}"
+            --offset "${{ inputs.offset }}"
+            --batch-size "${{ inputs.batch_size }}"
+            --sleep-ms "${{ inputs.sleep_ms }}"
+            --max-retries "${{ inputs.max_retries }}"
+            --retry-backoff-ms "${{ inputs.retry_backoff_ms }}"
+          )
           if [ -n "${{ inputs.symbols }}" ]; then
             ARGS+=(--symbols "${{ inputs.symbols }}")
+          elif [ -n "${{ inputs.symbols_file }}" ]; then
+            ARGS+=(--symbols-file "${{ inputs.symbols_file }}")
           fi
           if [ "${{ inputs.all }}" = "true" ]; then
             ARGS+=(--all)
