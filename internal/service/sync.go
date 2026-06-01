@@ -25,6 +25,10 @@ type SyncOptions struct {
 	Limit         int
 }
 
+type dailyBatchSource interface {
+	FetchDailyBatch(context.Context, []string, string) (map[string]schema.DailyQuoteRecord, map[string]error, error)
+}
+
 type Syncer struct {
 	Store   storage.ObjectStore
 	D1      d1.Client
@@ -51,8 +55,9 @@ func (s Syncer) Run(ctx context.Context, opt SyncOptions) error {
 	if opt.Market == "" {
 		opt.Market = "us"
 	}
+	dateExplicit := opt.Date != ""
 	if opt.Date == "" {
-		opt.Date = s.now().Format("2006-01-02")
+		opt.Date = defaultMarketDate(s.now())
 	}
 	if err := normalize.RequireDate(opt.Date); err != nil {
 		return err
@@ -80,13 +85,6 @@ func (s Syncer) Run(ctx context.Context, opt SyncOptions) error {
 	if err != nil {
 		return finish("failed", fmt.Errorf("fetch universe: %w", err))
 	}
-	universe := schema.SymbolUniverse{Date: opt.Date, Market: strings.ToUpper(opt.Market), Source: "nasdaqtrader", Symbols: symbols}
-	if err := s.writeJSON(ctx, storage.SymbolsLatestKey(opt.Market), universe); err != nil {
-		return finish("failed", err)
-	}
-	if err := s.writeJSON(ctx, storage.SymbolsDatedKey(opt.Market, opt.Date), universe); err != nil {
-		return finish("failed", err)
-	}
 	_ = s.writeSymbolsD1(ctx, opt.Market, symbols)
 
 	targets, err := LoadWatchlist(opt.WatchlistPath)
@@ -109,12 +107,34 @@ func (s Syncer) Run(ctx context.Context, opt SyncOptions) error {
 	universeMap := normalize.UniverseMap(symbols)
 	var records []schema.DailyQuoteRecord
 	var failedTargets []string
+	fetched, fetchFailures, err := s.fetchDailyRecords(ctx, targets, opt.Date, dateExplicit)
+	if err != nil {
+		return finish("failed", err)
+	}
+	if !dateExplicit {
+		if inferred, ok := inferDailyDate(fetched); ok {
+			opt.Date = inferred
+			run.Date = inferred
+		}
+	}
+	universe := schema.SymbolUniverse{Date: opt.Date, Market: strings.ToUpper(opt.Market), Source: "nasdaqtrader", Symbols: symbols}
+	if err := s.writeJSON(ctx, storage.SymbolsLatestKey(opt.Market), universe); err != nil {
+		return finish("failed", err)
+	}
+	if err := s.writeJSON(ctx, storage.SymbolsDatedKey(opt.Market, opt.Date), universe); err != nil {
+		return finish("failed", err)
+	}
 	for _, symbol := range targets {
-		record, err := s.Quotes.FetchDaily(ctx, symbol, opt.Date)
-		if err != nil {
+		symbol = strings.ToUpper(symbol)
+		record, ok := fetched[symbol]
+		if !ok {
 			run.RecordsFailed++
-			run.FailedSymbols = append(run.FailedSymbols, symbol+":"+err.Error())
-			failedTargets = append(failedTargets, strings.ToUpper(symbol))
+			if err := fetchFailures[symbol]; err != nil {
+				run.FailedSymbols = append(run.FailedSymbols, symbol+":"+err.Error())
+			} else {
+				run.FailedSymbols = append(run.FailedSymbols, symbol+":missing quote")
+			}
+			failedTargets = append(failedTargets, symbol)
 			continue
 		}
 		result := normalize.ValidateQuote(record, universeMap)
@@ -165,6 +185,66 @@ func (s Syncer) Run(ctx context.Context, opt SyncOptions) error {
 		return finish("partial", nil)
 	}
 	return finish("success", nil)
+}
+
+func (s Syncer) fetchDailyRecords(ctx context.Context, targets []string, date string, dateExplicit bool) (map[string]schema.DailyQuoteRecord, map[string]error, error) {
+	fetched := map[string]schema.DailyQuoteRecord{}
+	failures := map[string]error{}
+	if batcher, ok := s.Quotes.(dailyBatchSource); ok {
+		const batchSize = 200
+		for start := 0; start < len(targets); start += batchSize {
+			end := start + batchSize
+			if end > len(targets) {
+				end = len(targets)
+			}
+			targetDate := date
+			if !dateExplicit {
+				targetDate = ""
+			}
+			records, batchFailures, err := batcher.FetchDailyBatch(ctx, targets[start:end], targetDate)
+			if err != nil {
+				return nil, nil, err
+			}
+			for symbol, record := range records {
+				fetched[strings.ToUpper(symbol)] = record
+			}
+			for symbol, err := range batchFailures {
+				failures[strings.ToUpper(symbol)] = err
+			}
+		}
+		return fetched, failures, nil
+	}
+	for _, symbol := range targets {
+		record, err := s.Quotes.FetchDaily(ctx, symbol, date)
+		if err != nil {
+			failures[strings.ToUpper(symbol)] = err
+			continue
+		}
+		fetched[strings.ToUpper(symbol)] = record
+	}
+	return fetched, failures, nil
+}
+
+func inferDailyDate(records map[string]schema.DailyQuoteRecord) (string, bool) {
+	counts := map[string]int{}
+	bestDate := ""
+	bestCount := 0
+	for _, record := range records {
+		counts[record.Date]++
+		if counts[record.Date] > bestCount || (counts[record.Date] == bestCount && record.Date > bestDate) {
+			bestDate = record.Date
+			bestCount = counts[record.Date]
+		}
+	}
+	return bestDate, bestDate != ""
+}
+
+func defaultMarketDate(now time.Time) string {
+	loc, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		return now.UTC().Format("2006-01-02")
+	}
+	return now.In(loc).Format("2006-01-02")
 }
 
 func (s Syncer) updateHistories(ctx context.Context, market string, records []schema.DailyQuoteRecord) error {

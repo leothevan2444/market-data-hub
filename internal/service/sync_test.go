@@ -92,3 +92,14 @@ func TestSyncerRunKeepsStaleLatestOnPartialFailure(t *testing.T) {
 		t.Fatalf("expected AAPL to be marked stale: %+v", latest.Quotes["AAPL"])
 	}
 }
+
+func TestInferDailyDate(t *testing.T) {
+	date, ok := inferDailyDate(map[string]schema.DailyQuoteRecord{
+		"NVDA": {Date: "2026-05-29"},
+		"AAPL": {Date: "2026-05-29"},
+		"MSFT": {Date: "2026-05-28"},
+	})
+	if !ok || date != "2026-05-29" {
+		t.Fatalf("unexpected inferred date: %s ok=%v", date, ok)
+	}
+}
