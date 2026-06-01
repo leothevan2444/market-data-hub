@@ -10,8 +10,8 @@ import (
 
 	"market-data-hub/internal/normalize"
 	"market-data-hub/internal/schema"
+	"market-data-hub/internal/source/massive"
 	"market-data-hub/internal/source/nasdaqtrader"
-	"market-data-hub/internal/source/stooq"
 	"market-data-hub/internal/storage"
 	"market-data-hub/internal/storage/d1"
 	"market-data-hub/internal/storage/local"
@@ -22,11 +22,14 @@ type SyncOptions struct {
 	Market        string
 	Date          string
 	WatchlistPath string
-	Limit         int
 }
 
 type dailyBatchSource interface {
 	FetchDailyBatch(context.Context, []string, string) (map[string]schema.DailyQuoteRecord, map[string]error, error)
+}
+
+type dailyBulkSource interface {
+	FetchDailyBulk(context.Context, []string, string) (map[string]schema.DailyQuoteRecord, map[string]error, error)
 }
 
 type Syncer struct {
@@ -46,7 +49,7 @@ func NewSyncer(store storage.ObjectStore, d1Client d1.Client) Syncer {
 		Store:   store,
 		D1:      d1Client,
 		Symbols: nasdaqtrader.New(),
-		Quotes:  stooq.New(),
+		Quotes:  massive.New(),
 		Clock:   func() time.Time { return time.Now().UTC() },
 	}
 }
@@ -67,7 +70,7 @@ func (s Syncer) Run(ctx context.Context, opt SyncOptions) error {
 		Market:    strings.ToUpper(opt.Market),
 		Date:      opt.Date,
 		Status:    "running",
-		Source:    "stooq",
+		Source:    "massive",
 		StartedAt: s.now().Format(time.RFC3339),
 	}
 	finish := func(status string, err error) error {
@@ -87,19 +90,22 @@ func (s Syncer) Run(ctx context.Context, opt SyncOptions) error {
 	}
 	_ = s.writeSymbolsD1(ctx, opt.Market, symbols)
 
-	targets, err := LoadWatchlist(opt.WatchlistPath)
-	if err != nil {
-		return finish("failed", err)
-	}
-	if len(targets) == 0 {
+	var targets []string
+	if opt.WatchlistPath != "" {
+		var err error
+		targets, err = LoadWatchlist(opt.WatchlistPath)
+		if err != nil {
+			return finish("failed", err)
+		}
+		if len(targets) == 0 {
+			return finish("failed", fmt.Errorf("watchlist %s contains no symbols or does not exist", opt.WatchlistPath))
+		}
+	} else {
 		for _, sym := range symbols {
 			if sym.IsActive {
 				targets = append(targets, sym.Symbol)
 			}
 		}
-	}
-	if opt.Limit > 0 && len(targets) > opt.Limit {
-		targets = targets[:opt.Limit]
 	}
 	run.RecordsTotal = len(targets)
 
@@ -152,7 +158,7 @@ func (s Syncer) Run(ctx context.Context, opt SyncOptions) error {
 		return finish("failed", fmt.Errorf("no valid records synced"))
 	}
 	slices.SortFunc(records, func(a, b schema.DailyQuoteRecord) int { return strings.Compare(a.Symbol, b.Symbol) })
-	daily := schema.DailyMarketFile{Market: strings.ToUpper(opt.Market), Date: opt.Date, Type: "eod", Source: []string{"stooq"}, Count: len(records), SchemaVersion: 1, Records: records}
+	daily := schema.DailyMarketFile{Market: strings.ToUpper(opt.Market), Date: opt.Date, Type: "eod", Source: []string{"massive"}, Count: len(records), SchemaVersion: 1, Records: records}
 	dailyKey := storage.DailyKey(opt.Market, opt.Date)
 	if exists, _ := s.Store.Exists(ctx, dailyKey); exists {
 		return finish("failed", fmt.Errorf("%s already exists; use rebuild-history to replace derived history/latest", dailyKey))
@@ -190,6 +196,9 @@ func (s Syncer) Run(ctx context.Context, opt SyncOptions) error {
 func (s Syncer) fetchDailyRecords(ctx context.Context, targets []string, date string, dateExplicit bool) (map[string]schema.DailyQuoteRecord, map[string]error, error) {
 	fetched := map[string]schema.DailyQuoteRecord{}
 	failures := map[string]error{}
+	if bulk, ok := s.Quotes.(dailyBulkSource); ok {
+		return bulk.FetchDailyBulk(ctx, targets, date)
+	}
 	if batcher, ok := s.Quotes.(dailyBatchSource); ok {
 		const batchSize = 200
 		for start := 0; start < len(targets); start += batchSize {

@@ -2,5 +2,5 @@ markets:
   us:
     timezone: America/New_York
     currency: USD
-    defaultSource: stooq
+    defaultSource: massive
     enabled: true

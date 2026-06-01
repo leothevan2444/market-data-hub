@@ -15,7 +15,7 @@ type MarketConfig struct {
 }
 
 func DefaultMarket(market string) MarketConfig {
-	return MarketConfig{Market: strings.ToLower(market), Timezone: "America/New_York", Currency: "USD", DefaultSource: "stooq", Enabled: true}
+	return MarketConfig{Market: strings.ToLower(market), Timezone: "America/New_York", Currency: "USD", DefaultSource: "massive", Enabled: true}
 }
 
 func LoadWatchlist(path string) ([]string, error) {
