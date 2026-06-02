@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	"market-data-hub/internal/service"
 	"market-data-hub/internal/source/stooq"
@@ -26,12 +27,17 @@ func main() {
 	if err != nil {
 		fatal(err)
 	}
+	logf := func(format string, args ...any) {
+		fmt.Fprintf(os.Stderr, "[%s] %s\n", time.Now().UTC().Format(time.RFC3339), fmt.Sprintf(format, args...))
+	}
 	stooqClient := stooq.New()
+	stooqClient.Logf = logf
 	if *stooqArchiveFile != "" {
 		stooqClient.ArchiveFile = *stooqArchiveFile
 	}
 	backfiller := service.NewBackfiller(store, d1.FromEnv())
 	backfiller.Quotes = stooqClient
+	backfiller.Logf = logf
 	err = backfiller.Run(context.Background(), service.BackfillOptions{
 		Market:        *market,
 		From:          *from,

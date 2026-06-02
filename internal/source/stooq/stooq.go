@@ -22,6 +22,7 @@ type Client struct {
 	ArchiveFile string
 	APIKey      string
 	HTTP        *http.Client
+	Logf        func(string, ...any)
 }
 
 func New() Client {
@@ -39,6 +40,7 @@ func (c Client) FetchMarketHistory(ctx context.Context, symbols []string) (map[s
 		return c.fetchMarketHistoryFile(symbols)
 	}
 
+	c.logf("stooq archive download started")
 	tmp, err := os.CreateTemp("", "stooq-d-us-*.zip")
 	if err != nil {
 		return nil, err
@@ -65,28 +67,37 @@ func (c Client) FetchMarketHistory(ctx context.Context, symbols []string) (map[s
 		tmp.Close()
 		return nil, archiveInputError(err)
 	}
+	if info, err := tmp.Stat(); err == nil {
+		c.logf("stooq archive downloaded: %.1f MB", float64(info.Size())/1024/1024)
+	}
 	if err := tmp.Close(); err != nil {
 		return nil, archiveInputError(err)
 	}
 
+	c.logf("stooq archive opening")
 	zr, err := zip.OpenReader(tmpName)
 	if err != nil {
 		return nil, archiveInputError(err)
 	}
 	defer zr.Close()
-	return ParseArchiveFiles(zr.File, symbols)
+	return parseArchiveFiles(zr.File, symbols, c.Logf)
 }
 
 func (c Client) fetchMarketHistoryFile(symbols []string) (map[string][]schema.DailyQuoteRecord, error) {
+	c.logf("stooq archive opening local file: %s", c.ArchiveFile)
 	zr, err := zip.OpenReader(c.ArchiveFile)
 	if err != nil {
 		return nil, fmt.Errorf("open stooq archive file %s: %w", c.ArchiveFile, err)
 	}
 	defer zr.Close()
-	return ParseArchiveFiles(zr.File, symbols)
+	return parseArchiveFiles(zr.File, symbols, c.Logf)
 }
 
 func ParseArchiveFiles(files []*zip.File, symbols []string) (map[string][]schema.DailyQuoteRecord, error) {
+	return parseArchiveFiles(files, symbols, nil)
+}
+
+func parseArchiveFiles(files []*zip.File, symbols []string, logf func(string, ...any)) (map[string][]schema.DailyQuoteRecord, error) {
 	targets := map[string]bool{}
 	for _, symbol := range symbols {
 		symbol = strings.ToUpper(strings.TrimSpace(symbol))
@@ -94,15 +105,23 @@ func ParseArchiveFiles(files []*zip.File, symbols []string) (map[string][]schema
 			targets[symbol] = true
 		}
 	}
+	logProgress(logf, "stooq archive scan started: %d target symbols", len(targets))
 	out := map[string][]schema.DailyQuoteRecord{}
+	scanned := 0
+	matched := 0
 	for _, file := range files {
 		if file.FileInfo().IsDir() || !strings.EqualFold(filepath.Ext(file.Name), ".txt") {
 			continue
+		}
+		scanned++
+		if scanned%1000 == 0 {
+			logProgress(logf, "stooq archive scan progress: %d txt files scanned, %d target files matched", scanned, matched)
 		}
 		symbol := archiveSymbol(file.Name)
 		if symbol == "" || (len(targets) > 0 && !targets[symbol]) {
 			continue
 		}
+		matched++
 		rc, err := file.Open()
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", file.Name, err)
@@ -122,6 +141,7 @@ func ParseArchiveFiles(files []*zip.File, symbols []string) (map[string][]schema
 	for symbol := range out {
 		slices.SortFunc(out[symbol], func(a, b schema.DailyQuoteRecord) int { return strings.Compare(a.Date, b.Date) })
 	}
+	logProgress(logf, "stooq archive scan completed: %d txt files scanned, %d target files matched, %d symbols with records", scanned, matched, len(out))
 	return out, nil
 }
 
@@ -273,6 +293,16 @@ func (c Client) client() *http.Client {
 		return c.HTTP
 	}
 	return http.DefaultClient
+}
+
+func (c Client) logf(format string, args ...any) {
+	logProgress(c.Logf, format, args...)
+}
+
+func logProgress(logf func(string, ...any), format string, args ...any) {
+	if logf != nil {
+		logf(format, args...)
+	}
 }
 
 func archiveInputError(err error) error {

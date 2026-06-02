@@ -23,7 +23,14 @@ func main() {
 		fatal(err)
 	}
 	syncer := service.NewSyncer(store, d1.FromEnv())
-	err = syncer.Run(context.Background(), service.SyncOptions{Market: *market, Date: *date, WatchlistPath: *watchlist})
+	err = syncer.Run(context.Background(), service.SyncOptions{
+		Market:        *market,
+		Date:          *date,
+		WatchlistPath: *watchlist,
+		Log: func(format string, args ...any) {
+			fmt.Fprintf(os.Stderr, "[sync-daily] "+format+"\n", args...)
+		},
+	})
 	if err != nil {
 		fatal(err)
 	}

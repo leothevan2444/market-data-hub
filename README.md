@@ -145,7 +145,7 @@ There are three data-producing flows:
 2. Historical backfill: `cmd/backfill-history`
 3. Derived rebuild: `cmd/rebuild-history`
 
-Daily sync is the normal weekday update path. It loads the Nasdaq Trader symbol universe, targets the full active universe by default, or targets only `--watchlist` symbols when a watchlist path is provided. It fetches EOD quotes from Massive, validates and normalizes records, writes one immutable daily file, merges those records into each symbol history file, rebuilds `latest`, updates D1, and writes a run log.
+Daily sync is the normal weekday update path. It loads the Nasdaq Trader symbol universe, targets the full active universe by default, or targets only `--watchlist` symbols when a watchlist path is provided. It fetches EOD quotes from Massive, validates and normalizes records, writes one immutable daily file, merges those records into each symbol history file, rebuilds `latest`, updates D1, and writes a run log. The CLI prints progress logs to stderr, including target counts, fetch/validation counts, object write phases, D1 update phases, and symbol-history progress every 1,000 records.
 
 If `--date` is omitted, daily sync uses the latest date returned by the data source. If `--date` is provided, records that do not match that date are treated as failed. Existing daily files are not overwritten by daily sync; use backfill or rebuild when a date must be corrected.
 

@@ -22,6 +22,7 @@ type SyncOptions struct {
 	Market        string
 	Date          string
 	WatchlistPath string
+	Log           func(string, ...any)
 }
 
 type dailyBatchSource interface {
@@ -55,6 +56,12 @@ func NewSyncer(store storage.ObjectStore, d1Client d1.Client) Syncer {
 }
 
 func (s Syncer) Run(ctx context.Context, opt SyncOptions) error {
+	logf := func(format string, args ...any) {
+		if opt.Log != nil {
+			opt.Log(format, args...)
+		}
+	}
+	started := time.Now()
 	if opt.Market == "" {
 		opt.Market = "us"
 	}
@@ -65,6 +72,7 @@ func (s Syncer) Run(ctx context.Context, opt SyncOptions) error {
 	if err := normalize.RequireDate(opt.Date); err != nil {
 		return err
 	}
+	logf("start market=%s date=%s watchlist=%s", strings.ToUpper(opt.Market), opt.Date, displayWatchlist(opt.WatchlistPath))
 	run := schema.IngestionRun{
 		ID:        opt.Market + "-" + opt.Date + "-" + s.now().Format("150405"),
 		Market:    strings.ToUpper(opt.Market),
@@ -79,19 +87,28 @@ func (s Syncer) Run(ctx context.Context, opt SyncOptions) error {
 		if err != nil {
 			run.ErrorMessage = err.Error()
 		}
+		logf("finish status=%s total=%d success=%d failed=%d elapsed=%s", status, run.RecordsTotal, run.RecordsSuccess, run.RecordsFailed, time.Since(started).Round(time.Second))
 		_ = s.writeRun(ctx, opt.Date, run)
 		_ = s.writeRunD1(ctx, run)
 		return err
 	}
 
+	logf("fetching symbol universe")
 	symbols, err := s.Symbols.FetchUniverse(ctx)
 	if err != nil {
 		return finish("failed", fmt.Errorf("fetch universe: %w", err))
 	}
-	_ = s.writeSymbolsD1(ctx, opt.Market, symbols)
+	logf("fetched symbol universe symbols=%d", len(symbols))
+	if s.D1.Enabled() {
+		logf("updating D1 symbols rows=%d", len(symbols))
+	}
+	if err := s.writeSymbolsD1(ctx, opt.Market, symbols); err != nil {
+		logf("warning: update D1 symbols failed: %v", err)
+	}
 
 	var targets []string
 	if opt.WatchlistPath != "" {
+		logf("loading watchlist path=%s", opt.WatchlistPath)
 		var err error
 		targets, err = LoadWatchlist(opt.WatchlistPath)
 		if err != nil {
@@ -108,28 +125,35 @@ func (s Syncer) Run(ctx context.Context, opt SyncOptions) error {
 		}
 	}
 	run.RecordsTotal = len(targets)
+	logf("resolved targets count=%d", len(targets))
 
+	logf("reading previous latest snapshot")
 	previous := s.readLatest(ctx, opt.Market)
 	universeMap := normalize.UniverseMap(symbols)
 	var records []schema.DailyQuoteRecord
 	var failedTargets []string
+	logf("fetching daily quotes targets=%d date=%s", len(targets), opt.Date)
 	fetched, fetchFailures, err := s.fetchDailyRecords(ctx, targets, opt.Date, dateExplicit)
 	if err != nil {
 		return finish("failed", err)
 	}
+	logf("fetched daily quotes records=%d fetchFailures=%d", len(fetched), len(fetchFailures))
 	if !dateExplicit {
 		if inferred, ok := inferDailyDate(fetched); ok {
 			opt.Date = inferred
 			run.Date = inferred
+			logf("inferred daily date=%s", opt.Date)
 		}
 	}
 	universe := schema.SymbolUniverse{Date: opt.Date, Market: strings.ToUpper(opt.Market), Source: "nasdaqtrader", Symbols: symbols}
+	logf("writing symbol snapshots")
 	if err := s.writeJSON(ctx, storage.SymbolsLatestKey(opt.Market), universe); err != nil {
 		return finish("failed", err)
 	}
 	if err := s.writeJSON(ctx, storage.SymbolsDatedKey(opt.Market, opt.Date), universe); err != nil {
 		return finish("failed", err)
 	}
+	logf("validating target records")
 	for _, symbol := range targets {
 		symbol = strings.ToUpper(symbol)
 		record, ok := fetched[symbol]
@@ -154,19 +178,23 @@ func (s Syncer) Run(ctx context.Context, opt SyncOptions) error {
 		records = append(records, record)
 	}
 	run.RecordsSuccess = len(records)
+	logf("validated records success=%d failed=%d", run.RecordsSuccess, run.RecordsFailed)
 	if len(records) == 0 {
 		return finish("failed", fmt.Errorf("no valid records synced"))
 	}
 	slices.SortFunc(records, func(a, b schema.DailyQuoteRecord) int { return strings.Compare(a.Symbol, b.Symbol) })
 	daily := schema.DailyMarketFile{Market: strings.ToUpper(opt.Market), Date: opt.Date, Type: "eod", Source: []string{"massive"}, Count: len(records), SchemaVersion: 1, Records: records}
 	dailyKey := storage.DailyKey(opt.Market, opt.Date)
+	logf("checking daily object key=%s", dailyKey)
 	if exists, _ := s.Store.Exists(ctx, dailyKey); exists {
 		return finish("failed", fmt.Errorf("%s already exists; use rebuild-history to replace derived history/latest", dailyKey))
 	}
+	logf("writing daily object key=%s records=%d", dailyKey, len(records))
 	if err := s.writeGzipJSON(ctx, dailyKey, daily); err != nil {
 		return finish("failed", err)
 	}
 
+	logf("building latest snapshot")
 	latest := normalize.BuildLatest(opt.Market, opt.Date, records, previous)
 	for _, symbol := range failedTargets {
 		if previous.Quotes == nil {
@@ -177,16 +205,23 @@ func (s Syncer) Run(ctx context.Context, opt SyncOptions) error {
 			latest.Quotes[symbol] = quote
 		}
 	}
+	logf("writing latest snapshots quotes=%d staleCandidates=%d", len(latest.Quotes), len(failedTargets))
 	if err := s.writeJSON(ctx, storage.LatestKey(opt.Market), latest); err != nil {
 		return finish("failed", err)
 	}
 	if err := s.writeJSON(ctx, storage.LatestMinKey(opt.Market), normalize.BuildLatestMin(latest)); err != nil {
 		return finish("failed", err)
 	}
-	if err := s.updateHistories(ctx, opt.Market, records); err != nil {
+	logf("updating symbol histories records=%d", len(records))
+	if err := s.updateHistories(ctx, opt.Market, records, logf); err != nil {
 		return finish("failed", err)
 	}
-	_ = s.writeLatestD1(ctx, opt.Market, latest)
+	if s.D1.Enabled() {
+		logf("updating D1 latest rows=%d", len(latest.Quotes))
+	}
+	if err := s.writeLatestD1(ctx, opt.Market, latest); err != nil {
+		logf("warning: update D1 latest failed: %v", err)
+	}
 	if run.RecordsFailed > 0 {
 		return finish("partial", nil)
 	}
@@ -256,8 +291,9 @@ func defaultMarketDate(now time.Time) string {
 	return now.In(loc).Format("2006-01-02")
 }
 
-func (s Syncer) updateHistories(ctx context.Context, market string, records []schema.DailyQuoteRecord) error {
-	for _, r := range records {
+func (s Syncer) updateHistories(ctx context.Context, market string, records []schema.DailyQuoteRecord, logf func(string, ...any)) error {
+	total := len(records)
+	for i, r := range records {
 		key := storage.HistoryKey(market, r.Symbol)
 		history := schema.SymbolHistory{Symbol: r.Symbol, Market: strings.ToUpper(market), SchemaVersion: 1}
 		if raw, err := s.Store.Get(ctx, key); err == nil {
@@ -277,6 +313,10 @@ func (s Syncer) updateHistories(ctx context.Context, market string, records []sc
 		slices.SortFunc(history.Records, func(a, b schema.DailyQuoteRecord) int { return strings.Compare(a.Date, b.Date) })
 		if err := s.writeGzipJSON(ctx, key, history); err != nil {
 			return err
+		}
+		done := i + 1
+		if logf != nil && (done == 1 || done%1000 == 0 || done == total) {
+			logf("history progress %d/%d current=%s", done, total, r.Symbol)
 		}
 	}
 	return nil
@@ -353,6 +393,13 @@ func (s Syncer) now() time.Time {
 		return s.Clock()
 	}
 	return time.Now().UTC()
+}
+
+func displayWatchlist(path string) string {
+	if path == "" {
+		return "<all-active-symbols>"
+	}
+	return path
 }
 
 func boolInt(v bool) int {

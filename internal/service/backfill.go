@@ -35,6 +35,7 @@ type Backfiller struct {
 	}
 	Quotes marketHistoryFetcher
 	Clock  func() time.Time
+	Logf   func(string, ...any)
 }
 
 type marketHistoryFetcher interface {
@@ -52,6 +53,7 @@ func NewBackfiller(store storage.ObjectStore, d1Client d1.Client) Backfiller {
 }
 
 func (b Backfiller) Run(ctx context.Context, opt BackfillOptions) error {
+	started := b.now()
 	if opt.Market == "" {
 		opt.Market = "us"
 	}
@@ -92,13 +94,21 @@ func (b Backfiller) Run(ctx context.Context, opt BackfillOptions) error {
 		}
 		_ = b.writeRun(ctx, run.Date, run)
 		_ = b.writeRunD1(ctx, run)
+		if err != nil {
+			b.logf("backfill finished: status=%s error=%q elapsed=%s", status, err.Error(), b.now().Sub(started).Round(time.Second))
+		} else {
+			b.logf("backfill finished: status=%s total=%d success=%d failed=%d elapsed=%s", status, run.RecordsTotal, run.RecordsSuccess, run.RecordsFailed, b.now().Sub(started).Round(time.Second))
+		}
 		return err
 	}
 
+	b.logf("backfill started: market=%s from=%s to=%s watchlist=%s replace=%t", strings.ToUpper(opt.Market), dateLabel(opt.From, "earliest"), dateLabel(opt.To, "latest"), dateLabel(opt.WatchlistPath, "all-active"), opt.Replace)
+	b.logf("fetching symbol universe")
 	universe, err := b.Symbols.FetchUniverse(ctx)
 	if err != nil {
 		return finish("failed", fmt.Errorf("fetch universe: %w", err))
 	}
+	b.logf("symbol universe fetched: %d symbols", len(universe))
 
 	targets, err := resolveBackfillTargets(opt, universe)
 	if err != nil {
@@ -108,18 +118,22 @@ func (b Backfiller) Run(ctx context.Context, opt BackfillOptions) error {
 	if len(targets) == 0 {
 		return finish("failed", fmt.Errorf("no backfill targets resolved"))
 	}
+	b.logf("backfill targets resolved: %d symbols", len(targets))
 
 	universeMap := normalize.UniverseMap(universe)
 	bySymbol := map[string][]schema.DailyQuoteRecord{}
 	byDate := map[string][]schema.DailyQuoteRecord{}
+	b.logf("fetching backfill records from market archive")
 	recordsBySymbol, err := b.fetchBackfillRecords(ctx, targets, opt)
 	if err != nil {
 		return finish("failed", err)
 	}
+	b.logf("market archive records loaded: %d symbols returned", len(recordsBySymbol))
 	effectiveFrom, effectiveTo, err := resolveBackfillDateRange(recordsBySymbol, opt.From, opt.To)
 	if err != nil {
 		return finish("failed", err)
 	}
+	b.logf("effective date range resolved: %s to %s", effectiveFrom, effectiveTo)
 	start, _ := time.Parse("2006-01-02", effectiveFrom)
 	end, _ := time.Parse("2006-01-02", effectiveTo)
 	run.ID = fmt.Sprintf("%s-backfill-%s-%s-%s", strings.ToLower(opt.Market), effectiveFrom, effectiveTo, b.now().Format("150405"))
@@ -128,9 +142,11 @@ func (b Backfiller) Run(ctx context.Context, opt BackfillOptions) error {
 	if err := b.writeUniverse(ctx, opt.Market, effectiveTo, universe); err != nil {
 		return finish("failed", err)
 	}
+	b.logf("symbol snapshots written for date %s", effectiveTo)
 	_ = b.writeSymbolsD1(ctx, opt.Market, universe)
+	b.logf("symbol universe D1 update attempted")
 
-	for _, symbol := range targets {
+	for i, symbol := range targets {
 		symbol = strings.ToUpper(symbol)
 		records := recordsBySymbol[symbol]
 		valid, problems := filterBackfillRecords(records, start, end, universeMap)
@@ -149,10 +165,14 @@ func (b Backfiller) Run(ctx context.Context, opt BackfillOptions) error {
 		for _, record := range valid {
 			byDate[record.Date] = append(byDate[record.Date], record)
 		}
+		if (i+1)%500 == 0 || i+1 == len(targets) {
+			b.logf("record filtering progress: %d/%d symbols processed, success=%d failed=%d, dates=%d", i+1, len(targets), run.RecordsSuccess, run.RecordsFailed, len(byDate))
+		}
 	}
 	if len(bySymbol) == 0 {
 		return finish("failed", fmt.Errorf("no symbols produced valid backfill records"))
 	}
+	b.logf("record filtering completed: success=%d failed=%d dates=%d", run.RecordsSuccess, run.RecordsFailed, len(byDate))
 
 	if err := b.writeHistories(ctx, opt.Market, bySymbol, opt.Replace, effectiveFrom, effectiveTo); err != nil {
 		return finish("failed", fmt.Errorf("write histories: %w", err))
@@ -164,9 +184,11 @@ func (b Backfiller) Run(ctx context.Context, opt BackfillOptions) error {
 	if err != nil {
 		return finish("failed", fmt.Errorf("write latest: %w", err))
 	}
+	b.logf("latest files written: asOf=%s quotes=%d", latest.AsOf, len(latest.Quotes))
 	if err := b.writeLatestD1(ctx, opt.Market, latest); err != nil {
 		return finish("failed", fmt.Errorf("write latest D1: %w", err))
 	}
+	b.logf("latest D1 update completed")
 
 	if run.RecordsFailed > 0 {
 		return finish("partial", nil)
@@ -179,6 +201,12 @@ func (b Backfiller) fetchBackfillRecords(ctx context.Context, targets []string, 
 		return nil, fmt.Errorf("backfill requires a market archive history source")
 	}
 	return b.Quotes.FetchMarketHistory(ctx, targets)
+}
+
+func (b Backfiller) logf(format string, args ...any) {
+	if b.Logf != nil {
+		b.Logf(format, args...)
+	}
 }
 
 func resolveBackfillTargets(opt BackfillOptions, universe []schema.SymbolInfo) ([]string, error) {
@@ -263,6 +291,8 @@ func filterBackfillRecords(records []schema.DailyQuoteRecord, start, end time.Ti
 }
 
 func (b Backfiller) writeHistories(ctx context.Context, market string, bySymbol map[string][]schema.DailyQuoteRecord, replace bool, from, to string) error {
+	b.logf("writing history files: %d symbols", len(bySymbol))
+	written := 0
 	for symbol, records := range bySymbol {
 		key := storage.HistoryKey(market, symbol)
 		history := schema.SymbolHistory{Symbol: symbol, Market: strings.ToUpper(market), SchemaVersion: 1}
@@ -278,7 +308,12 @@ func (b Backfiller) writeHistories(ctx context.Context, market string, bySymbol 
 		if err := b.writeGzipJSON(ctx, key, history); err != nil {
 			return err
 		}
+		written++
+		if written%500 == 0 || written == len(bySymbol) {
+			b.logf("history write progress: %d/%d symbols", written, len(bySymbol))
+		}
 	}
+	b.logf("history files written: %d symbols", written)
 	return nil
 }
 
@@ -288,7 +323,8 @@ func (b Backfiller) writeDailyFiles(ctx context.Context, market string, byDate m
 		dates = append(dates, date)
 	}
 	slices.Sort(dates)
-	for _, date := range dates {
+	b.logf("writing daily files: %d dates", len(dates))
+	for i, date := range dates {
 		key := storage.DailyKey(market, date)
 		daily := schema.DailyMarketFile{Market: strings.ToUpper(market), Date: date, Type: "eod", Source: []string{"stooq"}, SchemaVersion: 1}
 		if raw, err := b.Store.Get(ctx, key); err == nil {
@@ -314,7 +350,11 @@ func (b Backfiller) writeDailyFiles(ctx context.Context, market string, byDate m
 		if err := b.writeGzipJSON(ctx, key, daily); err != nil {
 			return err
 		}
+		if (i+1)%250 == 0 || i+1 == len(dates) {
+			b.logf("daily write progress: %d/%d dates", i+1, len(dates))
+		}
 	}
+	b.logf("daily files written: %d dates", len(dates))
 	return nil
 }
 
