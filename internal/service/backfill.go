@@ -1,7 +1,6 @@
 package service
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -24,16 +23,8 @@ type BackfillOptions struct {
 	Market        string
 	From          string
 	To            string
-	Symbols       []string
-	SymbolsFile   string
 	WatchlistPath string
-	All           bool
 	Replace       bool
-	Offset        int
-	BatchSize     int
-	Sleep         time.Duration
-	MaxRetries    int
-	RetryBackoff  time.Duration
 }
 
 type Backfiller struct {
@@ -42,10 +33,12 @@ type Backfiller struct {
 	Symbols interface {
 		FetchUniverse(context.Context) ([]schema.SymbolInfo, error)
 	}
-	Quotes interface {
-		FetchHistory(context.Context, string) ([]schema.DailyQuoteRecord, error)
-	}
-	Clock func() time.Time
+	Quotes marketHistoryFetcher
+	Clock  func() time.Time
+}
+
+type marketHistoryFetcher interface {
+	FetchMarketHistory(context.Context, []string) (map[string][]schema.DailyQuoteRecord, error)
 }
 
 func NewBackfiller(store storage.ObjectStore, d1Client d1.Client) Backfiller {
@@ -62,22 +55,31 @@ func (b Backfiller) Run(ctx context.Context, opt BackfillOptions) error {
 	if opt.Market == "" {
 		opt.Market = "us"
 	}
-	if err := normalize.RequireDate(opt.From); err != nil {
-		return err
+	if opt.From != "" {
+		if err := normalize.RequireDate(opt.From); err != nil {
+			return err
+		}
 	}
-	if err := normalize.RequireDate(opt.To); err != nil {
-		return err
+	if opt.To != "" {
+		if err := normalize.RequireDate(opt.To); err != nil {
+			return err
+		}
 	}
-	start, _ := time.Parse("2006-01-02", opt.From)
-	end, _ := time.Parse("2006-01-02", opt.To)
-	if end.Before(start) {
+	if opt.From != "" && opt.To != "" && opt.To < opt.From {
 		return fmt.Errorf("to date must be on or after from date")
 	}
 
+	runFrom := dateLabel(opt.From, "first")
+	runTo := dateLabel(opt.To, "latest")
+	runDate := opt.To
+	if runDate == "" {
+		runDate = b.now().Format("2006-01-02")
+	}
+
 	run := schema.IngestionRun{
-		ID:        fmt.Sprintf("%s-backfill-%s-%s-%s", strings.ToLower(opt.Market), opt.From, opt.To, b.now().Format("150405")),
+		ID:        fmt.Sprintf("%s-backfill-%s-%s-%s", strings.ToLower(opt.Market), runFrom, runTo, b.now().Format("150405")),
 		Market:    strings.ToUpper(opt.Market),
-		Date:      opt.To,
+		Date:      runDate,
 		Status:    "running",
 		Source:    "stooq-backfill",
 		StartedAt: b.now().Format(time.RFC3339),
@@ -88,7 +90,7 @@ func (b Backfiller) Run(ctx context.Context, opt BackfillOptions) error {
 		if err != nil {
 			run.ErrorMessage = err.Error()
 		}
-		_ = b.writeRun(ctx, opt.To, run)
+		_ = b.writeRun(ctx, run.Date, run)
 		_ = b.writeRunD1(ctx, run)
 		return err
 	}
@@ -97,16 +99,11 @@ func (b Backfiller) Run(ctx context.Context, opt BackfillOptions) error {
 	if err != nil {
 		return finish("failed", fmt.Errorf("fetch universe: %w", err))
 	}
-	if err := b.writeUniverse(ctx, opt, universe); err != nil {
-		return finish("failed", err)
-	}
-	_ = b.writeSymbolsD1(ctx, opt.Market, universe)
 
 	targets, err := resolveBackfillTargets(opt, universe)
 	if err != nil {
 		return finish("failed", err)
 	}
-	targets = sliceBackfillTargets(targets, opt.Offset, opt.BatchSize)
 	run.RecordsTotal = len(targets)
 	if len(targets) == 0 {
 		return finish("failed", fmt.Errorf("no backfill targets resolved"))
@@ -115,18 +112,27 @@ func (b Backfiller) Run(ctx context.Context, opt BackfillOptions) error {
 	universeMap := normalize.UniverseMap(universe)
 	bySymbol := map[string][]schema.DailyQuoteRecord{}
 	byDate := map[string][]schema.DailyQuoteRecord{}
-	for i, symbol := range targets {
-		if opt.Sleep > 0 && i > 0 {
-			if err := sleepContext(ctx, opt.Sleep); err != nil {
-				return finish("failed", err)
-			}
-		}
-		records, err := b.fetchHistoryWithRetry(ctx, symbol, opt.MaxRetries, opt.RetryBackoff)
-		if err != nil {
-			run.RecordsFailed++
-			run.FailedSymbols = append(run.FailedSymbols, symbol+":"+err.Error())
-			continue
-		}
+	recordsBySymbol, err := b.fetchBackfillRecords(ctx, targets, opt)
+	if err != nil {
+		return finish("failed", err)
+	}
+	effectiveFrom, effectiveTo, err := resolveBackfillDateRange(recordsBySymbol, opt.From, opt.To)
+	if err != nil {
+		return finish("failed", err)
+	}
+	start, _ := time.Parse("2006-01-02", effectiveFrom)
+	end, _ := time.Parse("2006-01-02", effectiveTo)
+	run.ID = fmt.Sprintf("%s-backfill-%s-%s-%s", strings.ToLower(opt.Market), effectiveFrom, effectiveTo, b.now().Format("150405"))
+	run.Date = effectiveTo
+
+	if err := b.writeUniverse(ctx, opt.Market, effectiveTo, universe); err != nil {
+		return finish("failed", err)
+	}
+	_ = b.writeSymbolsD1(ctx, opt.Market, universe)
+
+	for _, symbol := range targets {
+		symbol = strings.ToUpper(symbol)
+		records := recordsBySymbol[symbol]
 		valid, problems := filterBackfillRecords(records, start, end, universeMap)
 		if len(problems) > 0 {
 			run.FailedSymbols = append(run.FailedSymbols, symbol+":"+strings.Join(problems, ","))
@@ -148,7 +154,7 @@ func (b Backfiller) Run(ctx context.Context, opt BackfillOptions) error {
 		return finish("failed", fmt.Errorf("no symbols produced valid backfill records"))
 	}
 
-	if err := b.writeHistories(ctx, opt.Market, bySymbol, opt.Replace, opt.From, opt.To); err != nil {
+	if err := b.writeHistories(ctx, opt.Market, bySymbol, opt.Replace, effectiveFrom, effectiveTo); err != nil {
 		return finish("failed", fmt.Errorf("write histories: %w", err))
 	}
 	if err := b.writeDailyFiles(ctx, opt.Market, byDate, opt.Replace); err != nil {
@@ -168,6 +174,13 @@ func (b Backfiller) Run(ctx context.Context, opt BackfillOptions) error {
 	return finish("success", nil)
 }
 
+func (b Backfiller) fetchBackfillRecords(ctx context.Context, targets []string, opt BackfillOptions) (map[string][]schema.DailyQuoteRecord, error) {
+	if b.Quotes == nil {
+		return nil, fmt.Errorf("backfill requires a market archive history source")
+	}
+	return b.Quotes.FetchMarketHistory(ctx, targets)
+}
+
 func resolveBackfillTargets(opt BackfillOptions, universe []schema.SymbolInfo) ([]string, error) {
 	seen := map[string]bool{}
 	add := func(symbol string, out *[]string) {
@@ -179,26 +192,7 @@ func resolveBackfillTargets(opt BackfillOptions, universe []schema.SymbolInfo) (
 		*out = append(*out, symbol)
 	}
 	var targets []string
-	for _, symbol := range opt.Symbols {
-		add(symbol, &targets)
-	}
-	if len(targets) == 0 && opt.SymbolsFile != "" {
-		fileSymbols, err := LoadSymbolList(opt.SymbolsFile)
-		if err != nil {
-			return nil, err
-		}
-		for _, symbol := range fileSymbols {
-			add(symbol, &targets)
-		}
-	}
-	if len(targets) == 0 && opt.All {
-		for _, symbol := range universe {
-			if symbol.IsActive {
-				add(symbol.Symbol, &targets)
-			}
-		}
-	}
-	if len(targets) == 0 && opt.WatchlistPath != "" {
+	if opt.WatchlistPath != "" {
 		watchlist, err := LoadWatchlist(opt.WatchlistPath)
 		if err != nil {
 			return nil, err
@@ -206,82 +200,46 @@ func resolveBackfillTargets(opt BackfillOptions, universe []schema.SymbolInfo) (
 		for _, symbol := range watchlist {
 			add(symbol, &targets)
 		}
+		return targets, nil
+	}
+	for _, symbol := range universe {
+		if symbol.IsActive {
+			add(symbol.Symbol, &targets)
+		}
 	}
 	return targets, nil
 }
 
-func LoadSymbolList(path string) ([]string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	var symbols []string
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		for _, part := range strings.Split(line, ",") {
-			part = strings.TrimSpace(part)
-			if part != "" {
-				symbols = append(symbols, strings.ToUpper(part))
+func resolveBackfillDateRange(recordsBySymbol map[string][]schema.DailyQuoteRecord, requestedFrom, requestedTo string) (string, string, error) {
+	from := requestedFrom
+	to := requestedTo
+	for _, records := range recordsBySymbol {
+		for _, record := range records {
+			if _, err := time.Parse("2006-01-02", record.Date); err != nil {
+				continue
+			}
+			if from == "" || record.Date < from {
+				from = record.Date
+			}
+			if to == "" || record.Date > to {
+				to = record.Date
 			}
 		}
 	}
-	return symbols, scanner.Err()
+	if from == "" || to == "" {
+		return "", "", fmt.Errorf("no dated records found in backfill archive")
+	}
+	if to < from {
+		return "", "", fmt.Errorf("to date must be on or after from date")
+	}
+	return from, to, nil
 }
 
-func sliceBackfillTargets(targets []string, offset, batchSize int) []string {
-	if offset < 0 {
-		offset = 0
+func dateLabel(value, fallback string) string {
+	if value != "" {
+		return value
 	}
-	if offset >= len(targets) {
-		return nil
-	}
-	targets = targets[offset:]
-	if batchSize > 0 && batchSize < len(targets) {
-		return targets[:batchSize]
-	}
-	return targets
-}
-
-func (b Backfiller) fetchHistoryWithRetry(ctx context.Context, symbol string, maxRetries int, backoff time.Duration) ([]schema.DailyQuoteRecord, error) {
-	if maxRetries < 0 {
-		maxRetries = 0
-	}
-	var lastErr error
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		records, err := b.Quotes.FetchHistory(ctx, symbol)
-		if err == nil {
-			return records, nil
-		}
-		lastErr = err
-		if attempt == maxRetries {
-			break
-		}
-		delay := backoff
-		if delay <= 0 {
-			delay = time.Second
-		}
-		delay *= time.Duration(attempt + 1)
-		if err := sleepContext(ctx, delay); err != nil {
-			return nil, err
-		}
-	}
-	return nil, lastErr
-}
-
-func sleepContext(ctx context.Context, d time.Duration) error {
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
+	return fallback
 }
 
 func filterBackfillRecords(records []schema.DailyQuoteRecord, start, end time.Time, universe map[string]schema.SymbolInfo) ([]schema.DailyQuoteRecord, []string) {
@@ -466,12 +424,12 @@ func (b Backfiller) readLatest(ctx context.Context, market string) schema.Latest
 	return latest
 }
 
-func (b Backfiller) writeUniverse(ctx context.Context, opt BackfillOptions, symbols []schema.SymbolInfo) error {
-	universe := schema.SymbolUniverse{Date: opt.To, Market: strings.ToUpper(opt.Market), Source: "nasdaqtrader", Symbols: symbols}
-	if err := b.writeJSON(ctx, storage.SymbolsLatestKey(opt.Market), universe); err != nil {
+func (b Backfiller) writeUniverse(ctx context.Context, market, date string, symbols []schema.SymbolInfo) error {
+	universe := schema.SymbolUniverse{Date: date, Market: strings.ToUpper(market), Source: "nasdaqtrader", Symbols: symbols}
+	if err := b.writeJSON(ctx, storage.SymbolsLatestKey(market), universe); err != nil {
 		return err
 	}
-	return b.writeJSON(ctx, storage.SymbolsDatedKey(opt.Market, opt.To), universe)
+	return b.writeJSON(ctx, storage.SymbolsDatedKey(market, date), universe)
 }
 
 func (b Backfiller) writeJSON(ctx context.Context, key string, v any) error {

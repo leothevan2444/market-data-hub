@@ -1,6 +1,7 @@
 package stooq
 
 import (
+	"archive/zip"
 	"context"
 	"encoding/csv"
 	"fmt"
@@ -8,6 +9,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -16,14 +19,22 @@ import (
 )
 
 type Client struct {
-	BaseURL  string
-	QuoteURL string
-	APIKey   string
-	HTTP     *http.Client
+	QuoteURL    string
+	ArchiveURL  string
+	ArchiveFile string
+	APIKey      string
+	HTTP        *http.Client
 }
 
 func New() Client {
-	return Client{BaseURL: "https://stooq.com/q/d/l/", QuoteURL: "https://stooq.com/q/l/", APIKey: os.Getenv("STOOQ_API_KEY"), HTTP: http.DefaultClient}
+	apiKey := os.Getenv("STOOQ_API_KEY")
+	return Client{
+		QuoteURL:    "https://stooq.com/q/l/",
+		ArchiveURL:  archiveURLFromEnv(),
+		ArchiveFile: os.Getenv("STOOQ_ARCHIVE_FILE"),
+		APIKey:      apiKey,
+		HTTP:        http.DefaultClient,
+	}
 }
 
 func (c Client) FetchDaily(ctx context.Context, symbol, date string) (schema.DailyQuoteRecord, error) {
@@ -78,38 +89,95 @@ func (c Client) FetchDailyBatch(ctx context.Context, symbols []string, date stri
 	return ParseQuoteCSV(res.Body, date)
 }
 
-func (c Client) FetchHistory(ctx context.Context, symbol string) ([]schema.DailyQuoteRecord, error) {
-	u, err := url.Parse(c.baseURL())
+func (c Client) FetchMarketHistory(ctx context.Context, symbols []string) (map[string][]schema.DailyQuoteRecord, error) {
+	if c.ArchiveFile != "" {
+		return c.fetchMarketHistoryFile(symbols)
+	}
+
+	tmp, err := os.CreateTemp("", "stooq-d-us-*.zip")
 	if err != nil {
 		return nil, err
 	}
-	q := u.Query()
-	q.Set("s", strings.ToLower(symbol)+".us")
-	q.Set("i", "d")
-	if c.APIKey != "" {
-		q.Set("apikey", c.APIKey)
-	}
-	u.RawQuery = q.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.archiveURL(), nil)
 	if err != nil {
+		tmp.Close()
 		return nil, err
 	}
 	res, err := c.client().Do(req)
 	if err != nil {
+		tmp.Close()
 		return nil, err
 	}
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return nil, fmt.Errorf("stooq %s: %s", symbol, res.Status)
+		tmp.Close()
+		return nil, archiveInputError(fmt.Errorf("stooq archive: %s", res.Status))
 	}
-	records, err := ParseCSV(res.Body, strings.ToUpper(symbol), "")
+	if _, err := io.Copy(tmp, res.Body); err != nil {
+		tmp.Close()
+		return nil, archiveInputError(err)
+	}
+	if err := tmp.Close(); err != nil {
+		return nil, archiveInputError(err)
+	}
+
+	zr, err := zip.OpenReader(tmpName)
 	if err != nil {
-		return nil, err
+		return nil, archiveInputError(err)
 	}
-	if len(records) == 0 {
-		return nil, fmt.Errorf("no stooq records for %s", symbol)
+	defer zr.Close()
+	return ParseArchiveFiles(zr.File, symbols)
+}
+
+func (c Client) fetchMarketHistoryFile(symbols []string) (map[string][]schema.DailyQuoteRecord, error) {
+	zr, err := zip.OpenReader(c.ArchiveFile)
+	if err != nil {
+		return nil, fmt.Errorf("open stooq archive file %s: %w", c.ArchiveFile, err)
 	}
-	return records, nil
+	defer zr.Close()
+	return ParseArchiveFiles(zr.File, symbols)
+}
+
+func ParseArchiveFiles(files []*zip.File, symbols []string) (map[string][]schema.DailyQuoteRecord, error) {
+	targets := map[string]bool{}
+	for _, symbol := range symbols {
+		symbol = strings.ToUpper(strings.TrimSpace(symbol))
+		if symbol != "" {
+			targets[symbol] = true
+		}
+	}
+	out := map[string][]schema.DailyQuoteRecord{}
+	for _, file := range files {
+		if file.FileInfo().IsDir() || !strings.EqualFold(filepath.Ext(file.Name), ".txt") {
+			continue
+		}
+		symbol := archiveSymbol(file.Name)
+		if symbol == "" || (len(targets) > 0 && !targets[symbol]) {
+			continue
+		}
+		rc, err := file.Open()
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", file.Name, err)
+		}
+		records, parseErr := ParseCSV(rc, symbol, "")
+		closeErr := rc.Close()
+		if parseErr != nil {
+			return nil, fmt.Errorf("%s: %w", file.Name, parseErr)
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("%s: %w", file.Name, closeErr)
+		}
+		if len(records) > 0 {
+			out[symbol] = append(out[symbol], records...)
+		}
+	}
+	for symbol := range out {
+		slices.SortFunc(out[symbol], func(a, b schema.DailyQuoteRecord) int { return strings.Compare(a.Date, b.Date) })
+	}
+	return out, nil
 }
 
 func ParseCSV(r io.Reader, symbol, targetDate string) ([]schema.DailyQuoteRecord, error) {
@@ -124,9 +192,13 @@ func ParseCSV(r io.Reader, symbol, targetDate string) ([]schema.DailyQuoteRecord
 	}
 	idx := map[string]int{}
 	for i, h := range rows[0] {
-		idx[strings.ToLower(h)] = i
+		idx[normalizeHeader(h)] = i
 	}
-	for _, required := range []string{"date", "open", "high", "low", "close", "volume"} {
+	volumeKey := "volume"
+	if _, ok := idx[volumeKey]; !ok {
+		volumeKey = "vol"
+	}
+	for _, required := range []string{"date", "open", "high", "low", "close", volumeKey} {
 		if _, ok := idx[required]; !ok {
 			return nil, fmt.Errorf("unexpected stooq csv header %q; if the response asks for an apikey, set STOOQ_API_KEY", strings.Join(rows[0], ","))
 		}
@@ -136,9 +208,13 @@ func ParseCSV(r io.Reader, symbol, targetDate string) ([]schema.DailyQuoteRecord
 		if len(row) < len(rows[0]) {
 			continue
 		}
-		d := row[idx["date"]]
+		d := normalizeDate(row[idx["date"]])
 		if targetDate != "" && d != targetDate {
 			continue
+		}
+		recordSymbol := strings.ToUpper(symbol)
+		if recordSymbol == "" {
+			recordSymbol = symbolFromRow(row, idx)
 		}
 		open, err := parseFloat(row, idx, "open")
 		if err != nil {
@@ -156,12 +232,12 @@ func ParseCSV(r io.Reader, symbol, targetDate string) ([]schema.DailyQuoteRecord
 		if err != nil {
 			return nil, err
 		}
-		volume, err := parseInt(row, idx, "volume")
+		volume, err := parseInt(row, idx, volumeKey)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, schema.DailyQuoteRecord{
-			Symbol:    strings.ToUpper(symbol),
+			Symbol:    recordSymbol,
 			Date:      d,
 			Open:      open,
 			High:      high,
@@ -280,11 +356,34 @@ func parseInt(row []string, idx map[string]int, name string) (int64, error) {
 	return int64(value), nil
 }
 
-func (c Client) baseURL() string {
-	if c.BaseURL != "" {
-		return c.BaseURL
+func archiveSymbol(path string) string {
+	name := strings.ToLower(filepath.Base(path))
+	name = strings.TrimSuffix(name, ".txt")
+	name = strings.TrimSuffix(name, ".us")
+	return strings.ToUpper(strings.TrimSpace(name))
+}
+
+func symbolFromRow(row []string, idx map[string]int) string {
+	i, ok := idx["ticker"]
+	if !ok || i >= len(row) {
+		return ""
 	}
-	return "https://stooq.com/q/d/l/"
+	return archiveSymbol(row[i] + ".txt")
+}
+
+func normalizeHeader(h string) string {
+	h = strings.TrimSpace(strings.ToLower(h))
+	return strings.Trim(h, "<>")
+}
+
+func normalizeDate(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) == 8 {
+		if _, err := time.Parse("20060102", value); err == nil {
+			return value[:4] + "-" + value[4:6] + "-" + value[6:]
+		}
+	}
+	return value
 }
 
 func (c Client) quoteURL() string {
@@ -294,9 +393,32 @@ func (c Client) quoteURL() string {
 	return "https://stooq.com/q/l/"
 }
 
+func (c Client) archiveURL() string {
+	if c.ArchiveURL != "" {
+		return c.ArchiveURL
+	}
+	if c.APIKey != "" {
+		return fmt.Sprintf("https://static.stooq.com/db/h/%s/d_us_txt.zip", c.APIKey)
+	}
+	return defaultArchiveURL
+}
+
+func archiveURLFromEnv() string {
+	if v := os.Getenv("STOOQ_ARCHIVE_URL"); v != "" {
+		return v
+	}
+	return ""
+}
+
 func (c Client) client() *http.Client {
 	if c.HTTP != nil {
 		return c.HTTP
 	}
 	return http.DefaultClient
 }
+
+func archiveInputError(err error) error {
+	return fmt.Errorf("%w; download the Stooq US daily archive manually and rerun with --stooq-archive-file PATH or STOOQ_ARCHIVE_FILE=PATH", err)
+}
+
+const defaultArchiveURL = "https://static.stooq.com/db/h/d_us_txt.zip"

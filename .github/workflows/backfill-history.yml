@@ -4,56 +4,26 @@ on:
   workflow_dispatch:
     inputs:
       from:
-        description: "Start date, YYYY-MM-DD"
-        required: true
+        description: "Optional start date, YYYY-MM-DD. Empty uses earliest archive record."
+        required: false
         type: string
       to:
-        description: "End date, YYYY-MM-DD"
-        required: true
-        type: string
-      symbols:
-        description: "Comma-separated symbols. Empty uses config/watchlist.yaml unless all=true."
+        description: "Optional end date, YYYY-MM-DD. Empty uses latest archive record."
         required: false
         type: string
-      symbols_file:
-        description: "Path to a symbol list file in the repo. Used only when symbols is empty."
+      watchlist:
+        description: "Optional watchlist path. Empty backfills all active US universe symbols."
         required: false
         type: string
-      all:
-        description: "Backfill all active US universe symbols"
-        required: false
-        type: boolean
-        default: false
       replace:
         description: "Replace target records inside the date range instead of merging"
         required: false
         type: boolean
         default: false
-      offset:
-        description: "Number of resolved symbols to skip"
+      stooq_archive_url:
+        description: "Optional URL to a manually downloaded d_us_txt.zip archive"
         required: false
         type: string
-        default: "0"
-      batch_size:
-        description: "Maximum symbols to process in this run. 0 means all resolved symbols."
-        required: false
-        type: string
-        default: "200"
-      sleep_ms:
-        description: "Delay between Stooq symbol requests in milliseconds"
-        required: false
-        type: string
-        default: "1000"
-      max_retries:
-        description: "Retry attempts per symbol after the first request"
-        required: false
-        type: string
-        default: "3"
-      retry_backoff_ms:
-        description: "Linear retry backoff base in milliseconds"
-        required: false
-        type: string
-        default: "2000"
 
 concurrency:
   group: market-data-backfill-us
@@ -87,21 +57,15 @@ jobs:
             --market us
             --from "${{ inputs.from }}"
             --to "${{ inputs.to }}"
-            --offset "${{ inputs.offset }}"
-            --batch-size "${{ inputs.batch_size }}"
-            --sleep-ms "${{ inputs.sleep_ms }}"
-            --max-retries "${{ inputs.max_retries }}"
-            --retry-backoff-ms "${{ inputs.retry_backoff_ms }}"
           )
-          if [ -n "${{ inputs.symbols }}" ]; then
-            ARGS+=(--symbols "${{ inputs.symbols }}")
-          elif [ -n "${{ inputs.symbols_file }}" ]; then
-            ARGS+=(--symbols-file "${{ inputs.symbols_file }}")
-          fi
-          if [ "${{ inputs.all }}" = "true" ]; then
-            ARGS+=(--all)
+          if [ -n "${{ inputs.watchlist }}" ]; then
+            ARGS+=(--watchlist "${{ inputs.watchlist }}")
           fi
           if [ "${{ inputs.replace }}" = "true" ]; then
             ARGS+=(--replace)
+          fi
+          if [ -n "${{ inputs.stooq_archive_url }}" ]; then
+            curl -L --fail --retry 3 --retry-delay 5 "${{ inputs.stooq_archive_url }}" -o d_us_txt.zip
+            ARGS+=(--stooq-archive-file d_us_txt.zip)
           fi
           go run ./cmd/backfill-history "${ARGS[@]}"

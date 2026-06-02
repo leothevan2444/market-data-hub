@@ -39,32 +39,35 @@ go run ./cmd/rebuild-history --storage local --root data --market us --from 2026
 Backfill historical data from Stooq into daily, history, latest, and D1 latest indexes:
 
 ```bash
-go run ./cmd/backfill-history --storage r2 --market us --watchlist config/watchlist.yaml --from 2024-01-01 --to 2024-12-31
+go run ./cmd/backfill-history --storage r2 --market us
 ```
 
-Use explicit symbols instead of the watchlist:
+Restrict backfill to a watchlist:
 
 ```bash
-go run ./cmd/backfill-history --storage r2 --market us --symbols NVDA,AAPL,MSFT --from 2024-01-01 --to 2024-12-31
+go run ./cmd/backfill-history --storage r2 --market us --watchlist config/watchlist.yaml
 ```
 
-For large runs, split the universe into batches and throttle Stooq requests:
+Limit the write range with optional `--from` and `--to` filters:
 
 ```bash
 go run ./cmd/backfill-history \
   --storage r2 \
   --market us \
-  --all \
   --from 2010-01-01 \
-  --to 2026-05-29 \
-  --offset 0 \
-  --batch-size 200 \
-  --sleep-ms 1000 \
-  --max-retries 3 \
-  --retry-backoff-ms 2000
+  --to 2026-05-29
 ```
 
-`--symbols-file` accepts newline or comma-separated symbol lists. Explicit `--symbols` wins over `--symbols-file`; `--symbols-file` wins over `--all`; `--all` wins over the default watchlist.
+For large runs, backfill downloads the Stooq US daily archive once, then filters it locally. If Stooq requires human verification, download the archive manually and pass it to the command:
+
+```bash
+go run ./cmd/backfill-history \
+  --storage r2 \
+  --market us \
+  --stooq-archive-file /path/to/d_us_txt.zip
+```
+
+By default, backfill targets all active symbols from the Nasdaq Trader universe and all dated records in the archive. Pass `--watchlist` to restrict symbols, and pass `--from` and/or `--to` to restrict dates.
 
 By default, backfill merges fetched records into existing objects. Add `--replace` to replace target symbol records inside the requested date range while preserving other symbols and dates outside the range.
 
@@ -146,7 +149,7 @@ Daily sync is the normal weekday update path. It loads the Nasdaq Trader symbol 
 
 If `--date` is omitted, daily sync uses the latest date returned by the data source. If `--date` is provided, records that do not match that date are treated as failed. Existing daily files are not overwritten by daily sync; use backfill or rebuild when a date must be corrected.
 
-Historical backfill is the large dataset construction path. It fetches historical daily bars from Stooq per symbol, filters them to `--from` and `--to`, then writes:
+Historical backfill is the large dataset construction path. It downloads the Stooq US daily archive (`https://static.stooq.com/db/h/{STOOQ_API_KEY}/d_us_txt.zip` when `STOOQ_API_KEY` is set), filters it to the requested target symbols and optional `--from`/`--to` range, then writes:
 
 - daily files for each date in the range
 - per-symbol history files
@@ -154,7 +157,7 @@ Historical backfill is the large dataset construction path. It fetches historica
 - D1 `latest_quotes`
 - symbol snapshots and run logs
 
-Backfill target priority is `--symbols`, then `--symbols-file`, then `--all`, then `config/watchlist.yaml`. Use `--offset`, `--batch-size`, `--sleep-ms`, `--max-retries`, and `--retry-backoff-ms` to split full-market work into resumable chunks and reduce pressure on upstream data sources.
+Backfill targets all active universe symbols by default. If `--watchlist` is provided, it targets only those symbols. If `--from` is omitted, backfill starts from the earliest dated archive record; if `--to` is omitted, it writes through the latest dated archive record. If Stooq blocks automated archive downloads with human verification, download `d_us_txt.zip` manually and pass `--stooq-archive-file /path/to/d_us_txt.zip` locally, or provide `stooq_archive_url` when running the GitHub workflow. `STOOQ_ARCHIVE_FILE` and `STOOQ_ARCHIVE_URL` can override the archive input for local runs, mirrors, or fixtures.
 
 Backfill defaults to merge mode. Merge mode inserts or replaces only fetched symbol/date records while preserving all other existing records. `--replace` is scoped to the requested symbols and date range: it removes existing records for those symbols inside the range, then writes the fetched records, while preserving other symbols and dates outside the range.
 
@@ -172,8 +175,9 @@ These estimates count application-level operations performed by this repo. They 
 
 Definitions:
 
-- `S`: successful quote records written to the daily file, equal to `recordsSuccess`.
+- `S`: successful symbols processed. For daily sync, this is also the successful quote records written to that daily file.
 - `T`: target symbols attempted, equal to `recordsTotal`.
+- `D`: trading dates written by a historical backfill.
 - `U`: symbol universe rows fetched from Nasdaq Trader.
 - `L`: quotes written to `latest_quotes`; for a clean daily sync this is usually equal to `S`, plus any stale quotes retained from a previous latest file.
 
@@ -215,7 +219,40 @@ If D1 is not configured, D1 reads and writes are skipped.
 
 ### Historical Backfill
 
-Cost estimate: TBD.
+`cmd/backfill-history` reads one Stooq archive, writes symbol snapshots, writes one history object per successful symbol, writes one daily file per trading date, updates latest files, updates D1, and writes a run log.
+
+R2 object operations:
+
+| Operation class | Formula | Per 1,000 successful symbols | Per 10,000 successful symbols |
+| --- | ---: | ---: | ---: |
+| A class writes | `S + D + 5` | `1,005 + D` | `10,005 + D` |
+| B class reads | `2S + D + 1` | `2,001 + D` | `20,001 + D` |
+
+R2 A class writes are:
+
+- `1` `symbols/latest`
+- `1` `symbols/{effectiveTo}`
+- `S` `history/{symbol}/daily.json.gz`
+- `D` `daily/{date}.json.gz`
+- `1` `latest.json`
+- `1` `latest.min.json`
+- `1` `runs/{effectiveTo}/backfill`
+
+R2 B class reads are:
+
+- `S` existing symbol history reads before merging backfill records
+- `D` existing daily file reads before merging daily records
+- `1` previous `latest.json`
+- `S` symbol history reads while deriving latest quote fields
+
+D1 operations, when D1 environment variables are configured:
+
+| Operation | Formula | Notes |
+| --- | ---: | --- |
+| Row writes | `U + L + 1` | `symbols` upserts, `latest_quotes` upserts, and one `ingestion_runs` upsert. |
+| Row reads | up to `U` | `symbols` upserts preserve `first_seen` with one lookup per universe row; first-time runs may return fewer rows. |
+
+If D1 is not configured, D1 reads and writes are skipped.
 
 ### Derived Rebuild
 
@@ -231,14 +268,14 @@ Required sync environment variables:
 - `CLOUDFLARE_API_TOKEN`
 - `D1_DATABASE_ID`
 
-Backfill still uses Stooq and may require `STOOQ_API_KEY`.
+Backfill uses Stooq's downloadable US daily archive. Set `STOOQ_API_KEY` to build the keyed static archive URL, provide a local manually downloaded archive with `--stooq-archive-file`, or provide an archive URL with the GitHub workflow `stooq_archive_url` input.
 
 Apply the D1 migration in `worker/migrations/0001_initial.sql`, then set `worker/wrangler.toml` bindings for the actual R2 bucket and D1 database id.
 
 GitHub Actions:
 
 - `Sync Market Data` runs daily and supports manual one-day sync.
-- `Backfill Market History` is manual only and supports `from`, `to`, `symbols`, `symbols_file`, `all`, `replace`, `offset`, `batch_size`, `sleep_ms`, `max_retries`, and `retry_backoff_ms` inputs.
+- `Backfill Market History` is manual only and supports `from`, `to`, `watchlist`, `replace`, and `stooq_archive_url` inputs.
 
 ## Worker
 

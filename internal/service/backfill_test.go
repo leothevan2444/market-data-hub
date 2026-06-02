@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,26 +25,31 @@ func (fakeBackfillSymbols) FetchUniverse(context.Context) ([]schema.SymbolInfo, 
 
 type fakeBackfillQuotes struct{}
 
-func (fakeBackfillQuotes) FetchHistory(_ context.Context, symbol string) ([]schema.DailyQuoteRecord, error) {
-	if symbol == "MSFT" {
-		return nil, errors.New("source unavailable")
+func (fakeBackfillQuotes) FetchMarketHistory(_ context.Context, symbols []string) (map[string][]schema.DailyQuoteRecord, error) {
+	out := map[string][]schema.DailyQuoteRecord{}
+	for _, symbol := range symbols {
+		if symbol == "MSFT" {
+			continue
+		}
+		out[strings.ToUpper(symbol)] = []schema.DailyQuoteRecord{
+			quote(symbol, "2024-06-03", 10),
+			quote(symbol, "2024-06-04", 11),
+		}
 	}
-	return []schema.DailyQuoteRecord{
-		quote(symbol, "2024-06-03", 10),
-		quote(symbol, "2024-06-04", 11),
-	}, nil
+	return out, nil
 }
 
-type flakyBackfillQuotes struct {
-	calls map[string]int
+type fakeMarketBackfillQuotes struct {
+	calls int
 }
 
-func (f *flakyBackfillQuotes) FetchHistory(_ context.Context, symbol string) ([]schema.DailyQuoteRecord, error) {
-	f.calls[symbol]++
-	if f.calls[symbol] == 1 {
-		return nil, errors.New("temporary failure")
+func (f *fakeMarketBackfillQuotes) FetchMarketHistory(_ context.Context, symbols []string) (map[string][]schema.DailyQuoteRecord, error) {
+	f.calls++
+	out := map[string][]schema.DailyQuoteRecord{}
+	for _, symbol := range symbols {
+		out[strings.ToUpper(symbol)] = []schema.DailyQuoteRecord{quote(symbol, "2024-06-04", 11)}
 	}
-	return []schema.DailyQuoteRecord{quote(symbol, "2024-06-04", 11)}, nil
+	return out, nil
 }
 
 func TestBackfillWritesDailyHistoryLatestAndPartialRun(t *testing.T) {
@@ -110,32 +114,32 @@ func TestMergeRecordsReplaceOnlyTargetRange(t *testing.T) {
 	}
 }
 
-func TestResolveBackfillTargetsFileAllAndBatch(t *testing.T) {
+func TestResolveBackfillTargetsWatchlistOrAllActiveAndBatch(t *testing.T) {
 	root := t.TempDir()
-	path := filepath.Join(root, "symbols.txt")
-	if err := os.WriteFile(path, []byte("nvda,aapl\n# comment\nMSFT\n"), 0o644); err != nil {
+	path := filepath.Join(root, "watchlist.yaml")
+	if err := os.WriteFile(path, []byte("watchlist:\n  - nvda\n  - aapl\n  - nvda\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	universe := []schema.SymbolInfo{{Symbol: "AAA", IsActive: true}, {Symbol: "BBB", IsActive: false}, {Symbol: "CCC", IsActive: true}}
-	targets, err := resolveBackfillTargets(BackfillOptions{SymbolsFile: path, All: true}, universe)
+	targets, err := resolveBackfillTargets(BackfillOptions{WatchlistPath: path}, universe)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(targets, ","); got != "NVDA,AAPL,MSFT" {
-		t.Fatalf("symbols file should beat all, got %s", got)
+	if got := strings.Join(targets, ","); got != "NVDA,AAPL" {
+		t.Fatalf("watchlist should restrict targets, got %s", got)
 	}
-	targets, err = resolveBackfillTargets(BackfillOptions{All: true}, universe)
+	targets, err = resolveBackfillTargets(BackfillOptions{}, universe)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(sliceBackfillTargets(targets, 1, 1), ","); got != "CCC" {
-		t.Fatalf("unexpected sliced all targets: %s", got)
+	if got := strings.Join(targets, ","); got != "AAA,CCC" {
+		t.Fatalf("unexpected all active targets: %s", got)
 	}
 }
 
-func TestBackfillRetriesTransientFetchFailure(t *testing.T) {
+func TestBackfillUsesMarketHistoryFetcherOnce(t *testing.T) {
 	store := local.New(t.TempDir())
-	quotes := &flakyBackfillQuotes{calls: map[string]int{}}
+	quotes := &fakeMarketBackfillQuotes{}
 	backfiller := Backfiller{
 		Store:   store,
 		Symbols: fakeBackfillSymbols{},
@@ -143,19 +147,60 @@ func TestBackfillRetriesTransientFetchFailure(t *testing.T) {
 		Clock:   func() time.Time { return time.Date(2026, 6, 1, 1, 2, 3, 0, time.UTC) },
 	}
 	err := backfiller.Run(context.Background(), BackfillOptions{
-		Market:       "us",
-		From:         "2024-06-04",
-		To:           "2024-06-04",
-		Symbols:      []string{"NVDA"},
-		MaxRetries:   1,
-		RetryBackoff: time.Millisecond,
+		Market:        "us",
+		From:          "2024-06-04",
+		To:            "2024-06-04",
+		WatchlistPath: watchlistFile(t, "NVDA", "AAPL"),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if quotes.calls["NVDA"] != 2 {
-		t.Fatalf("expected retry, got %d calls", quotes.calls["NVDA"])
+	if quotes.calls != 1 {
+		t.Fatalf("expected one market archive fetch, got %d", quotes.calls)
 	}
+}
+
+func TestBackfillInfersMissingDateRange(t *testing.T) {
+	store := local.New(t.TempDir())
+	backfiller := Backfiller{
+		Store:   store,
+		Symbols: fakeBackfillSymbols{},
+		Quotes:  fakeBackfillQuotes{},
+		Clock:   func() time.Time { return time.Date(2026, 6, 1, 1, 2, 3, 0, time.UTC) },
+	}
+	err := backfiller.Run(context.Background(), BackfillOptions{
+		Market:        "us",
+		WatchlistPath: watchlistFile(t, "NVDA"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var run schema.IngestionRun
+	readObject(t, store, "runs/2024/us-backfill-2024-06-03-2024-06-04-010203.json", &run)
+	if run.Status != "success" || run.Date != "2024-06-04" || run.RecordsSuccess != 1 {
+		t.Fatalf("unexpected inferred range run: %+v", run)
+	}
+	for _, date := range []string{"2024-06-03", "2024-06-04"} {
+		var daily schema.DailyMarketFile
+		readObject(t, store, storage.DailyKey("us", date), &daily)
+		if daily.Count != 1 {
+			t.Fatalf("expected one daily record for %s, got %d", date, daily.Count)
+		}
+	}
+}
+
+func watchlistFile(t *testing.T, symbols ...string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "watchlist.yaml")
+	lines := []string{"watchlist:"}
+	for _, symbol := range symbols {
+		lines = append(lines, "  - "+symbol)
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func readObject(t *testing.T, store local.Store, key string, out any) {
