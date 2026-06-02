@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -19,7 +18,6 @@ import (
 )
 
 type Client struct {
-	QuoteURL    string
 	ArchiveURL  string
 	ArchiveFile string
 	APIKey      string
@@ -29,64 +27,11 @@ type Client struct {
 func New() Client {
 	apiKey := os.Getenv("STOOQ_API_KEY")
 	return Client{
-		QuoteURL:    "https://stooq.com/q/l/",
 		ArchiveURL:  archiveURLFromEnv(),
 		ArchiveFile: os.Getenv("STOOQ_ARCHIVE_FILE"),
 		APIKey:      apiKey,
 		HTTP:        http.DefaultClient,
 	}
-}
-
-func (c Client) FetchDaily(ctx context.Context, symbol, date string) (schema.DailyQuoteRecord, error) {
-	records, failures, err := c.FetchDailyBatch(ctx, []string{symbol}, date)
-	if err != nil {
-		return schema.DailyQuoteRecord{}, err
-	}
-	symbol = strings.ToUpper(symbol)
-	if err := failures[symbol]; err != nil {
-		return schema.DailyQuoteRecord{}, err
-	}
-	record, ok := records[symbol]
-	if !ok {
-		return schema.DailyQuoteRecord{}, fmt.Errorf("no stooq quote for %s", symbol)
-	}
-	return record, nil
-}
-
-func (c Client) FetchDailyBatch(ctx context.Context, symbols []string, date string) (map[string]schema.DailyQuoteRecord, map[string]error, error) {
-	if len(symbols) == 0 {
-		return map[string]schema.DailyQuoteRecord{}, map[string]error{}, nil
-	}
-	u, err := url.Parse(c.quoteURL())
-	if err != nil {
-		return nil, nil, err
-	}
-	stooqSymbols := make([]string, 0, len(symbols))
-	for _, symbol := range symbols {
-		stooqSymbols = append(stooqSymbols, strings.ToLower(strings.TrimSpace(symbol))+".us")
-	}
-	q := u.Query()
-	q.Set("s", strings.Join(stooqSymbols, " "))
-	q.Set("f", "sd2t2ohlcv")
-	q.Set("h", "")
-	q.Set("e", "csv")
-	if c.APIKey != "" {
-		q.Set("apikey", c.APIKey)
-	}
-	u.RawQuery = q.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil, nil, err
-	}
-	res, err := c.client().Do(req)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer res.Body.Close()
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return nil, nil, fmt.Errorf("stooq quote batch: %s", res.Status)
-	}
-	return ParseQuoteCSV(res.Body, date)
 }
 
 func (c Client) FetchMarketHistory(ctx context.Context, symbols []string) (map[string][]schema.DailyQuoteRecord, error) {
@@ -253,86 +198,6 @@ func ParseCSV(r io.Reader, symbol, targetDate string) ([]schema.DailyQuoteRecord
 	return out, nil
 }
 
-func ParseQuoteCSV(r io.Reader, targetDate string) (map[string]schema.DailyQuoteRecord, map[string]error, error) {
-	cr := csv.NewReader(r)
-	cr.FieldsPerRecord = -1
-	rows, err := cr.ReadAll()
-	if err != nil {
-		return nil, nil, err
-	}
-	if len(rows) < 2 {
-		return nil, nil, fmt.Errorf("empty stooq quote csv")
-	}
-	idx := map[string]int{}
-	for i, h := range rows[0] {
-		idx[strings.ToLower(h)] = i
-	}
-	for _, required := range []string{"symbol", "date", "open", "high", "low", "close", "volume"} {
-		if _, ok := idx[required]; !ok {
-			return nil, nil, fmt.Errorf("unexpected stooq quote csv header %q", strings.Join(rows[0], ","))
-		}
-	}
-	records := map[string]schema.DailyQuoteRecord{}
-	failures := map[string]error{}
-	for _, row := range rows[1:] {
-		if len(row) < len(rows[0]) {
-			continue
-		}
-		rawSymbol := row[idx["symbol"]]
-		symbol := strings.ToUpper(strings.TrimSuffix(rawSymbol, ".US"))
-		if symbol == "" {
-			continue
-		}
-		if strings.EqualFold(row[idx["date"]], "N/D") {
-			failures[symbol] = fmt.Errorf("stooq quote unavailable")
-			continue
-		}
-		if targetDate != "" && row[idx["date"]] != targetDate {
-			failures[symbol] = fmt.Errorf("stooq quote date %s does not match target date %s", row[idx["date"]], targetDate)
-			continue
-		}
-		open, err := parseFloat(row, idx, "open")
-		if err != nil {
-			failures[symbol] = err
-			continue
-		}
-		high, err := parseFloat(row, idx, "high")
-		if err != nil {
-			failures[symbol] = err
-			continue
-		}
-		low, err := parseFloat(row, idx, "low")
-		if err != nil {
-			failures[symbol] = err
-			continue
-		}
-		closePrice, err := parseFloat(row, idx, "close")
-		if err != nil {
-			failures[symbol] = err
-			continue
-		}
-		volume, err := parseInt(row, idx, "volume")
-		if err != nil {
-			failures[symbol] = err
-			continue
-		}
-		records[symbol] = schema.DailyQuoteRecord{
-			Symbol:    symbol,
-			Date:      row[idx["date"]],
-			Open:      open,
-			High:      high,
-			Low:       low,
-			Close:     closePrice,
-			AdjClose:  closePrice,
-			Volume:    volume,
-			Currency:  "USD",
-			Source:    "stooq",
-			UpdatedAt: time.Now().UTC().Format(time.RFC3339),
-		}
-	}
-	return records, failures, nil
-}
-
 func parseFloat(row []string, idx map[string]int, name string) (float64, error) {
 	i, ok := idx[name]
 	if !ok {
@@ -384,13 +249,6 @@ func normalizeDate(value string) string {
 		}
 	}
 	return value
-}
-
-func (c Client) quoteURL() string {
-	if c.QuoteURL != "" {
-		return c.QuoteURL
-	}
-	return "https://stooq.com/q/l/"
 }
 
 func (c Client) archiveURL() string {
