@@ -1,9 +1,6 @@
 name: Sync Market Data
 
 on:
-  schedule:
-    - cron: "00 21 * * 1-5"
-      timezone: "America/New_York"
   workflow_dispatch:
     inputs:
       date:
