@@ -8,7 +8,7 @@ Daily EOD market-data warehouse for personal trading tools and AI agents. It is 
 - Cloudflare R2 object layout for daily, latest, symbol, history, and run files.
 - Cloudflare D1 schema for symbols, latest quotes, and ingestion logs.
 - Cloudflare Worker API for quote/history/daily/universe/context queries.
-- GitHub Actions schedule for weekday US market EOD sync.
+- VPS/systemd deployment scripts for weekday US market EOD sync.
 
 ## Local Usage
 
@@ -274,8 +274,85 @@ Apply the D1 migration in `worker/migrations/0001_initial.sql`, then set `worker
 
 GitHub Actions:
 
-- `Sync Market Data` runs daily and supports manual one-day sync.
+- `Sync Market Data` is a manual fallback workflow.
 - `Backfill Market History` is manual only and supports `from`, `to`, `watchlist`, `replace`, and `stooq_archive_url` inputs.
+
+## VPS Daily Sync
+
+The production daily sync should run from a VPS with `systemd timer`. GitHub Actions can remain as a manual fallback, but it is not the primary scheduler.
+
+On the VPS, install Go, clone the repo, then run:
+
+```bash
+./scripts/install.sh
+```
+
+The installer:
+
+- builds `cmd/sync-daily` into `bin/sync-daily`
+- installs runtime files under `/opt/market-data-hub`
+- creates `/etc/market-data-hub/env` from `deploy/vps/env.example` if it does not exist
+- installs `market-data-sync.service` and `market-data-sync.timer`
+- enables and starts the timer
+
+Fill in `/etc/market-data-hub/env` with real secrets:
+
+```bash
+sudo editor /etc/market-data-hub/env
+```
+
+Required values:
+
+```bash
+MARKET_DATA_MARKET=us
+MARKET_DATA_STORAGE=r2
+R2_BUCKET=...
+MASSIVE_API_KEY=...
+CLOUDFLARE_ACCOUNT_ID=...
+CLOUDFLARE_API_TOKEN=...
+D1_DATABASE_ID=...
+```
+
+The production wrapper does not pass `--date`, so the syncer uses the latest date returned by the data source. This avoids failures caused by scheduler delays crossing midnight. It also does not pass `--watchlist`, so the daily VPS sync targets the full active US universe.
+
+Check the timer:
+
+```bash
+systemctl list-timers market-data-sync.timer
+systemctl status market-data-sync.timer
+```
+
+Run one sync manually:
+
+```bash
+sudo systemctl start market-data-sync.service
+```
+
+Inspect logs:
+
+```bash
+journalctl -u market-data-sync.service -n 100 --no-pager
+```
+
+Uninstall the VPS service and installed runtime files:
+
+```bash
+./scripts/uninstall.sh
+```
+
+The uninstall script keeps `/etc/market-data-hub/env` by default because it contains secrets. To remove it too:
+
+```bash
+./scripts/uninstall.sh --purge-env
+```
+
+The timer is configured as:
+
+```text
+Mon..Fri 19:30 America/New_York
+```
+
+`Persistent=true` lets systemd run a missed sync after the VPS comes back online. The wrapper script uses a file lock so overlapping sync attempts are skipped instead of running concurrently.
 
 ## Worker
 

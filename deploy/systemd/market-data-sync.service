@@ -1,0 +1,16 @@
+[Unit]
+Description=Market Data Hub daily EOD sync
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=MARKET_DATA_HOME=/opt/market-data-hub
+EnvironmentFile=/etc/market-data-hub/env
+WorkingDirectory=/opt/market-data-hub
+ExecStart=/opt/market-data-hub/scripts/run-sync-daily.sh
+TimeoutStartSec=6h
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

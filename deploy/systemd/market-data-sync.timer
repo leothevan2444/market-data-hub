@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Market Data Hub daily EOD sync after US market close
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 19:30:00 America/New_York
+Persistent=true
+AccuracySec=1min
+RandomizedDelaySec=2min
+Unit=market-data-sync.service
+
+[Install]
+WantedBy=timers.target
