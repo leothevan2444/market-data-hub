@@ -1,5 +1,7 @@
 # Market Data Hub
 
+[English](README.md) | [中文](README.zh-CN.md)
+
 Daily EOD market-data warehouse for personal trading tools and AI agents. It is a batch data layer, not a real-time quote service.
 
 ## What It Builds
