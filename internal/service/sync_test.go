@@ -112,6 +112,39 @@ func TestSyncerRunDefaultsToActiveUniverse(t *testing.T) {
 	}
 }
 
+func TestSyncerRunOverwritesExistingDailyFile(t *testing.T) {
+	root := t.TempDir()
+	store := local.New(root)
+	existing := schema.DailyMarketFile{Market: "US", Date: "2026-05-31", Type: "eod", Source: []string{"old"}, Count: 0, SchemaVersion: 1}
+	raw, err := storage.MarshalGzipJSON(existing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Put(context.Background(), storage.DailyKey("us", "2026-05-31"), raw, "application/json"); err != nil {
+		t.Fatal(err)
+	}
+	syncer := Syncer{
+		Store:   store,
+		Symbols: fakeSymbols{},
+		Quotes:  fakeQuotes{},
+		Clock:   func() time.Time { return time.Date(2026, 5, 31, 1, 2, 3, 0, time.UTC) },
+	}
+	if err := syncer.Run(context.Background(), SyncOptions{Market: "us", Date: "2026-05-31"}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err = store.Get(context.Background(), storage.DailyKey("us", "2026-05-31"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var daily schema.DailyMarketFile
+	if err := storage.UnmarshalMaybeGzip(raw, &daily); err != nil {
+		t.Fatal(err)
+	}
+	if daily.Source[0] != "massive" || daily.Count != 2 {
+		t.Fatalf("expected daily file to be overwritten, got %+v", daily)
+	}
+}
+
 func TestSyncerRunUsesDailyBulkSource(t *testing.T) {
 	root := t.TempDir()
 	watchlist := filepath.Join(root, "watchlist.yaml")

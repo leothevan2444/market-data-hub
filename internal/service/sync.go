@@ -190,7 +190,9 @@ func (s Syncer) Run(ctx context.Context, opt SyncOptions) error {
 	dailyKey := storage.DailyKey(opt.Market, opt.Date)
 	logf("checking daily object key=%s", dailyKey)
 	if exists, _ := s.Store.Exists(ctx, dailyKey); exists {
-		return finish("failed", fmt.Errorf("%s already exists; use rebuild-history to replace derived history/latest", dailyKey))
+		logf("overwriting existing daily object key=%s", dailyKey)
+	} else {
+		logf("creating daily object key=%s", dailyKey)
 	}
 	logf("writing daily object key=%s records=%d", dailyKey, len(records))
 	if err := s.writeGzipJSON(ctx, dailyKey, daily); err != nil {
