@@ -364,6 +364,13 @@ Mon..Fri 19:30 America/New_York
 
 ## Worker
 
+Worker 是公开读取 API。它绑定：
+
+- `MARKET_DATA`：R2 bucket binding。
+- `DB`：D1 database binding。
+
+部署：
+
 ```bash
 cd worker
 npm install
@@ -371,13 +378,177 @@ npm run typecheck
 npm run deploy
 ```
 
-Routes：
+所有 API 响应都会包含：
 
-- `GET /quote/:symbol`
-- `GET /history/:symbol?range=1y`
-- `GET /daily/us/:date`
-- `GET /universe/us`
-- `GET /context/:symbol`
+- `Content-Type: application/json; charset=utf-8`
+- `Cache-Control: public, max-age=60`
+- 允许浏览器从任意 origin 发起 `GET` 请求的 CORS headers。
+
+Worker 会处理 `OPTIONS` 预检请求，并返回 `204 No Content`。
+
+### Worker API
+
+#### `GET /quote/:symbol`
+
+从 D1 `latest_quotes` 返回单个 symbol 的 latest quote。
+
+示例：
+
+```bash
+curl https://<worker-host>/quote/NVDA
+```
+
+响应：
+
+```json
+{
+  "symbol": "NVDA",
+  "date": "2026-06-01",
+  "price": 102.4,
+  "change": 1.23,
+  "changePct": 1.216,
+  "volume": 123456789,
+  "source": "massive"
+}
+```
+
+错误：
+
+- `400 {"error":"bad_symbol"}`：symbol 格式非法。
+- `404 {"error":"not_found","symbol":"NVDA"}`：不存在 latest quote。
+
+#### `GET /history/:symbol?range=1y`
+
+从 R2 `history/us/{SYMBOL}/daily.json.gz` 返回单个 symbol 的 daily history。
+
+支持的 `range` 值：
+
+- `1m`：从最新记录往前 31 个自然日。
+- `3m`：从最新记录往前 92 个自然日。
+- `6m`：从最新记录往前 183 个自然日。
+- `1y`：从最新记录往前 365 个自然日。
+- `max` 或省略：全部记录。
+
+未知 `range` 当前会回退为全部记录。
+
+示例：
+
+```bash
+curl "https://<worker-host>/history/NVDA?range=1y"
+```
+
+响应：
+
+```json
+{
+  "symbol": "NVDA",
+  "range": "1y",
+  "records": [
+    {
+      "symbol": "NVDA",
+      "date": "2026-06-01",
+      "open": 100.5,
+      "high": 103.2,
+      "low": 99.8,
+      "close": 102.4,
+      "adjClose": 102.4,
+      "volume": 123456789,
+      "source": "massive",
+      "updatedAt": "2026-06-02T01:00:00Z"
+    }
+  ]
+}
+```
+
+错误：
+
+- `400 {"error":"bad_symbol"}`：symbol 格式非法。
+- `404 {"error":"not_found","symbol":"NVDA"}`：history object 不存在。
+
+#### `GET /daily/us/:date`
+
+从 R2 `daily/us/YYYY/YYYY-MM-DD.json.gz` 返回某个日期的全市场 daily 文件。
+
+示例：
+
+```bash
+curl https://<worker-host>/daily/us/2026-06-01
+```
+
+响应结构与数据布局章节中的 `DailyMarketFile` 相同。
+
+错误：
+
+- `404 {"error":"not_found","key":"daily/us/2026/2026-06-01.json.gz"}`：daily object 不存在。
+
+#### `GET /universe/us`
+
+从 R2 `symbols/us/latest.json` 返回最新 US symbol universe。
+
+示例：
+
+```bash
+curl https://<worker-host>/universe/us
+```
+
+响应：
+
+```json
+{
+  "date": "2026-06-01",
+  "market": "US",
+  "source": "nasdaqtrader",
+  "symbols": [
+    {
+      "symbol": "NVDA",
+      "name": "NVIDIA Corporation",
+      "exchange": "NASDAQ",
+      "assetType": "stock",
+      "isEtf": false,
+      "isActive": true
+    }
+  ]
+}
+```
+
+#### `GET /context/:symbol`
+
+组合 D1 `latest_quotes` 和 D1 `symbols`，返回一个 compact context object。
+
+示例：
+
+```bash
+curl https://<worker-host>/context/NVDA
+```
+
+响应：
+
+```json
+{
+  "symbol": "NVDA",
+  "name": "NVIDIA Corporation",
+  "market": "US",
+  "exchange": "NASDAQ",
+  "latest": {
+    "date": "2026-06-01",
+    "price": 102.4,
+    "changePct": 1.216,
+    "volume": 123456789
+  },
+  "stats": null
+}
+```
+
+错误：
+
+- `400 {"error":"bad_symbol"}`：symbol 格式非法。
+- `404 {"error":"not_found","symbol":"NVDA"}`：不存在 latest quote。
+
+通用错误：
+
+- `404 {"error":"not_found"}`：未知 route。
+- `405 {"error":"method_not_allowed"}`：使用了 `GET` 和 `OPTIONS` 之外的方法。
+- `500 {"error":"internal_error","message":"..."}`：Worker 发生非预期错误。
 
 ## 边界
 

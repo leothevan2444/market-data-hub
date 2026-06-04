@@ -364,6 +364,13 @@ Mon..Fri 19:30 America/New_York
 
 ## Worker
 
+The Worker is the public read API. It binds to:
+
+- `MARKET_DATA`: R2 bucket binding.
+- `DB`: D1 database binding.
+
+Deploy:
+
 ```bash
 cd worker
 npm install
@@ -371,13 +378,177 @@ npm run typecheck
 npm run deploy
 ```
 
-Routes:
+All API responses include:
 
-- `GET /quote/:symbol`
-- `GET /history/:symbol?range=1y`
-- `GET /daily/us/:date`
-- `GET /universe/us`
-- `GET /context/:symbol`
+- `Content-Type: application/json; charset=utf-8`
+- `Cache-Control: public, max-age=60`
+- CORS headers allowing browser `GET` requests from any origin.
+
+The Worker handles `OPTIONS` preflight requests with `204 No Content`.
+
+### Worker API
+
+#### `GET /quote/:symbol`
+
+Returns the latest quote for one symbol from D1 `latest_quotes`.
+
+Example:
+
+```bash
+curl https://<worker-host>/quote/NVDA
+```
+
+Response:
+
+```json
+{
+  "symbol": "NVDA",
+  "date": "2026-06-01",
+  "price": 102.4,
+  "change": 1.23,
+  "changePct": 1.216,
+  "volume": 123456789,
+  "source": "massive"
+}
+```
+
+Errors:
+
+- `400 {"error":"bad_symbol"}` for malformed symbols.
+- `404 {"error":"not_found","symbol":"NVDA"}` when no latest quote exists.
+
+#### `GET /history/:symbol?range=1y`
+
+Returns daily history for one symbol from R2 `history/us/{SYMBOL}/daily.json.gz`.
+
+Supported `range` values:
+
+- `1m`: latest 31 calendar days from the newest record.
+- `3m`: latest 92 calendar days.
+- `6m`: latest 183 calendar days.
+- `1y`: latest 365 calendar days.
+- `max` or omitted: all records.
+
+Unknown range values currently fall back to all records.
+
+Example:
+
+```bash
+curl "https://<worker-host>/history/NVDA?range=1y"
+```
+
+Response:
+
+```json
+{
+  "symbol": "NVDA",
+  "range": "1y",
+  "records": [
+    {
+      "symbol": "NVDA",
+      "date": "2026-06-01",
+      "open": 100.5,
+      "high": 103.2,
+      "low": 99.8,
+      "close": 102.4,
+      "adjClose": 102.4,
+      "volume": 123456789,
+      "source": "massive",
+      "updatedAt": "2026-06-02T01:00:00Z"
+    }
+  ]
+}
+```
+
+Errors:
+
+- `400 {"error":"bad_symbol"}` for malformed symbols.
+- `404 {"error":"not_found","symbol":"NVDA"}` when the history object does not exist.
+
+#### `GET /daily/us/:date`
+
+Returns one market-wide daily file from R2 `daily/us/YYYY/YYYY-MM-DD.json.gz`.
+
+Example:
+
+```bash
+curl https://<worker-host>/daily/us/2026-06-01
+```
+
+Response shape is the same as `DailyMarketFile` in the data layout section.
+
+Errors:
+
+- `404 {"error":"not_found","key":"daily/us/2026/2026-06-01.json.gz"}` when the daily object does not exist.
+
+#### `GET /universe/us`
+
+Returns the latest US symbol universe from R2 `symbols/us/latest.json`.
+
+Example:
+
+```bash
+curl https://<worker-host>/universe/us
+```
+
+Response:
+
+```json
+{
+  "date": "2026-06-01",
+  "market": "US",
+  "source": "nasdaqtrader",
+  "symbols": [
+    {
+      "symbol": "NVDA",
+      "name": "NVIDIA Corporation",
+      "exchange": "NASDAQ",
+      "assetType": "stock",
+      "isEtf": false,
+      "isActive": true
+    }
+  ]
+}
+```
+
+#### `GET /context/:symbol`
+
+Returns a compact context object by combining D1 `latest_quotes` and D1 `symbols`.
+
+Example:
+
+```bash
+curl https://<worker-host>/context/NVDA
+```
+
+Response:
+
+```json
+{
+  "symbol": "NVDA",
+  "name": "NVIDIA Corporation",
+  "market": "US",
+  "exchange": "NASDAQ",
+  "latest": {
+    "date": "2026-06-01",
+    "price": 102.4,
+    "changePct": 1.216,
+    "volume": 123456789
+  },
+  "stats": null
+}
+```
+
+Errors:
+
+- `400 {"error":"bad_symbol"}` for malformed symbols.
+- `404 {"error":"not_found","symbol":"NVDA"}` when no latest quote exists.
+
+Common errors:
+
+- `404 {"error":"not_found"}` for unknown routes.
+- `405 {"error":"method_not_allowed"}` for methods other than `GET` and `OPTIONS`.
+- `500 {"error":"internal_error","message":"..."}` for unexpected Worker errors.
 
 ## Boundaries
 
