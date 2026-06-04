@@ -22,21 +22,29 @@ const jsonHeaders = {
   "cache-control": "public, max-age=60"
 };
 
+const corsHeaders = {
+  "access-control-allow-origin": "*",
+  "access-control-allow-methods": "GET, OPTIONS",
+  "access-control-allow-headers": "Content-Type, Authorization",
+  "access-control-max-age": "86400"
+};
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const parts = url.pathname.split("/").filter(Boolean);
 
     try {
-      if (request.method !== "GET") return json({ error: "method_not_allowed" }, 405);
-      if (parts[0] === "quote" && parts[1]) return quote(env, parts[1]);
-      if (parts[0] === "history" && parts[1]) return history(env, parts[1], url.searchParams.get("range"));
-      if (parts[0] === "daily" && parts[1] === "us" && parts[2]) return r2JSON(env, `daily/us/${parts[2].slice(0, 4)}/${parts[2]}.json.gz`);
-      if (parts[0] === "universe" && parts[1] === "us") return r2JSON(env, "symbols/us/latest.json");
-      if (parts[0] === "context" && parts[1]) return context(env, parts[1]);
-      return json({ error: "not_found" }, 404);
+      if (request.method === "OPTIONS") return corsPreflight(request);
+      if (request.method !== "GET") return withCors(json({ error: "method_not_allowed" }, 405));
+      if (parts[0] === "quote" && parts[1]) return withCors(await quote(env, parts[1]));
+      if (parts[0] === "history" && parts[1]) return withCors(await history(env, parts[1], url.searchParams.get("range")));
+      if (parts[0] === "daily" && parts[1] === "us" && parts[2]) return withCors(await r2JSON(env, `daily/us/${parts[2].slice(0, 4)}/${parts[2]}.json.gz`));
+      if (parts[0] === "universe" && parts[1] === "us") return withCors(await r2JSON(env, "symbols/us/latest.json"));
+      if (parts[0] === "context" && parts[1]) return withCors(await context(env, parts[1]));
+      return withCors(json({ error: "not_found" }, 404));
     } catch (error) {
-      return json({ error: "internal_error", message: error instanceof Error ? error.message : String(error) }, 500);
+      return withCors(json({ error: "internal_error", message: error instanceof Error ? error.message : String(error) }, 500));
     }
   }
 };
@@ -123,4 +131,25 @@ function normalizeSymbol(symbol: string): string | null {
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), { status, headers: jsonHeaders });
+}
+
+function corsPreflight(request: Request): Response {
+  const headers = new Headers(corsHeaders);
+  const requestedHeaders = request.headers.get("Access-Control-Request-Headers");
+  if (requestedHeaders) {
+    headers.set("access-control-allow-headers", requestedHeaders);
+  }
+  return new Response(null, { status: 204, headers });
+}
+
+function withCors(response: Response): Response {
+  const headers = new Headers(response.headers);
+  for (const [name, value] of Object.entries(corsHeaders)) {
+    headers.set(name, value);
+  }
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers
+  });
 }
