@@ -16,6 +16,7 @@ func main() {
 	storageName := flag.String("storage", "local", "storage backend: local or r2")
 	root := flag.String("root", "data", "local storage root")
 	watchlist := flag.String("watchlist", "", "optional watchlist path; defaults to all active symbols")
+	r2Concurrency := flag.Int("r2-concurrency", 16, "parallel workers for R2/object-store history updates")
 	flag.Parse()
 
 	store, err := service.StorageFor(*storageName, *root)
@@ -27,6 +28,7 @@ func main() {
 		Market:        *market,
 		Date:          *date,
 		WatchlistPath: *watchlist,
+		R2Workers:     *r2Concurrency,
 		Log: func(format string, args ...any) {
 			fmt.Fprintf(os.Stderr, "[sync-daily] "+format+"\n", args...)
 		},

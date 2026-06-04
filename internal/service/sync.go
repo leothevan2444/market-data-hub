@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"market-data-hub/internal/normalize"
@@ -22,6 +24,7 @@ type SyncOptions struct {
 	Market        string
 	Date          string
 	WatchlistPath string
+	R2Workers     int
 	Log           func(string, ...any)
 }
 
@@ -212,8 +215,9 @@ func (s Syncer) Run(ctx context.Context, opt SyncOptions) error {
 	if err := s.writeJSON(ctx, storage.LatestMinKey(opt.Market), normalize.BuildLatestMin(latest)); err != nil {
 		return finish("failed", err)
 	}
-	logf("updating symbol histories records=%d", len(records))
-	if err := s.updateHistories(ctx, opt.Market, records, logf); err != nil {
+	r2Workers := r2WorkerCount(opt.R2Workers)
+	logf("updating symbol histories records=%d r2Workers=%d", len(records), r2Workers)
+	if err := s.updateHistories(ctx, opt.Market, records, r2Workers, logf); err != nil {
 		return finish("failed", err)
 	}
 	if s.D1.Enabled() {
@@ -291,33 +295,95 @@ func defaultMarketDate(now time.Time) string {
 	return now.In(loc).Format("2006-01-02")
 }
 
-func (s Syncer) updateHistories(ctx context.Context, market string, records []schema.DailyQuoteRecord, logf func(string, ...any)) error {
+func (s Syncer) updateHistories(ctx context.Context, market string, records []schema.DailyQuoteRecord, workers int, logf func(string, ...any)) error {
 	total := len(records)
-	for i, r := range records {
-		key := storage.HistoryKey(market, r.Symbol)
-		history := schema.SymbolHistory{Symbol: r.Symbol, Market: strings.ToUpper(market), SchemaVersion: 1}
-		if raw, err := s.Store.Get(ctx, key); err == nil {
-			_ = storage.UnmarshalMaybeGzip(raw, &history)
-		}
-		replaced := false
-		for i := range history.Records {
-			if history.Records[i].Date == r.Date {
-				history.Records[i] = r
-				replaced = true
-				break
+	if total == 0 {
+		return nil
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > total {
+		workers = total
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	jobs := make(chan schema.DailyQuoteRecord)
+	errCh := make(chan error, 1)
+	var completed int64
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case r, ok := <-jobs:
+					if !ok {
+						return
+					}
+					if err := s.updateHistory(ctx, market, r); err != nil {
+						select {
+						case errCh <- err:
+						default:
+						}
+						cancel()
+						return
+					}
+					done := int(atomic.AddInt64(&completed, 1))
+					if logf != nil && (done == 1 || done%1000 == 0 || done == total) {
+						logf("history progress %d/%d current=%s", done, total, r.Symbol)
+					}
+				}
 			}
+		}()
+	}
+
+	var sendErr error
+send:
+	for _, r := range records {
+		select {
+		case <-ctx.Done():
+			sendErr = ctx.Err()
+			break send
+		case jobs <- r:
 		}
-		if !replaced {
-			history.Records = append(history.Records, r)
+	}
+	close(jobs)
+	wg.Wait()
+
+	select {
+	case err := <-errCh:
+		return err
+	default:
+	}
+	return sendErr
+}
+
+func (s Syncer) updateHistory(ctx context.Context, market string, r schema.DailyQuoteRecord) error {
+	key := storage.HistoryKey(market, r.Symbol)
+	history := schema.SymbolHistory{Symbol: r.Symbol, Market: strings.ToUpper(market), SchemaVersion: 1}
+	if raw, err := s.Store.Get(ctx, key); err == nil {
+		_ = storage.UnmarshalMaybeGzip(raw, &history)
+	}
+	replaced := false
+	for i := range history.Records {
+		if history.Records[i].Date == r.Date {
+			history.Records[i] = r
+			replaced = true
+			break
 		}
-		slices.SortFunc(history.Records, func(a, b schema.DailyQuoteRecord) int { return strings.Compare(a.Date, b.Date) })
-		if err := s.writeGzipJSON(ctx, key, history); err != nil {
-			return err
-		}
-		done := i + 1
-		if logf != nil && (done == 1 || done%1000 == 0 || done == total) {
-			logf("history progress %d/%d current=%s", done, total, r.Symbol)
-		}
+	}
+	if !replaced {
+		history.Records = append(history.Records, r)
+	}
+	slices.SortFunc(history.Records, func(a, b schema.DailyQuoteRecord) int { return strings.Compare(a.Date, b.Date) })
+	if err := s.writeGzipJSON(ctx, key, history); err != nil {
+		return err
 	}
 	return nil
 }
@@ -400,6 +466,13 @@ func displayWatchlist(path string) string {
 		return "<all-active-symbols>"
 	}
 	return path
+}
+
+func r2WorkerCount(workers int) int {
+	if workers > 0 {
+		return workers
+	}
+	return 16
 }
 
 func boolInt(v bool) int {
