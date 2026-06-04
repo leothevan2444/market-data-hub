@@ -3,3 +3,4 @@ env.sh
 worker/node_modules/
 .wrangler/
 .DS_Store
+bin
