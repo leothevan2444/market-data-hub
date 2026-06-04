@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"testing"
+	"time"
 )
 
 func TestStoreUsesCloudflareRESTAPI(t *testing.T) {
@@ -53,6 +54,92 @@ func TestStoreUsesCloudflareRESTAPI(t *testing.T) {
 	}
 	if string(got) != "ok" {
 		t.Fatalf("unexpected payload: %q", string(got))
+	}
+}
+
+func TestStoreRetriesPutOnTransientFailures(t *testing.T) {
+	attempts := 0
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodPut {
+			t.Fatalf("unexpected method: %s", r.Method)
+		}
+		attempts++
+		switch attempts {
+		case 1:
+			return response(http.StatusInternalServerError, "try again"), nil
+		case 2:
+			return response(http.StatusTooManyRequests, "slow down"), nil
+		default:
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(body) != "ok" {
+				t.Fatalf("unexpected payload: %q", string(body))
+			}
+			return response(http.StatusOK, ""), nil
+		}
+	})}
+
+	store := Store{
+		AccountID:       "acct",
+		APIToken:        "token",
+		Bucket:          "market-data",
+		BaseURL:         "https://api.test",
+		Client:          client,
+		PutRetryBackoff: -1,
+	}
+	if err := store.Put(context.Background(), "daily/us/2024/test.json", []byte("ok"), "application/json"); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 3 {
+		t.Fatalf("expected 3 put attempts, got %d", attempts)
+	}
+}
+
+func TestStoreDoesNotRetryPutOnClientError(t *testing.T) {
+	attempts := 0
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		attempts++
+		return response(http.StatusForbidden, "forbidden"), nil
+	})}
+
+	store := Store{
+		AccountID:       "acct",
+		APIToken:        "token",
+		Bucket:          "market-data",
+		BaseURL:         "https://api.test",
+		Client:          client,
+		PutRetryBackoff: -1,
+	}
+	if err := store.Put(context.Background(), "daily/us/2024/test.json", []byte("ok"), "application/json"); err == nil {
+		t.Fatal("expected put to fail")
+	}
+	if attempts != 1 {
+		t.Fatalf("expected 1 put attempt, got %d", attempts)
+	}
+}
+
+func TestPutRetryDelayForRateLimit(t *testing.T) {
+	store := Store{}
+	res := response(http.StatusTooManyRequests, "")
+	res.Header.Set("Retry-After", "7")
+	if delay := store.putRetryDelay(res, 0); delay != 7*time.Second {
+		t.Fatalf("expected retry-after delay, got %s", delay)
+	}
+
+	res = response(http.StatusTooManyRequests, "")
+	if delay := store.putRetryDelay(res, 0); delay != defaultRateLimitDelay {
+		t.Fatalf("expected default rate-limit delay, got %s", delay)
+	}
+}
+
+func TestRetryAfterDelayParsesHTTPDate(t *testing.T) {
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	value := now.Add(3 * time.Second).Format(http.TimeFormat)
+	delay, ok := retryAfterDelay(value, now)
+	if !ok || delay != 3*time.Second {
+		t.Fatalf("expected 3s retry-after date delay, got %s ok=%v", delay, ok)
 	}
 }
 
