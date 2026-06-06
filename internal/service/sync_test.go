@@ -38,8 +38,11 @@ func (partialQuotes) FetchDaily(_ context.Context, symbol, date string) (schema.
 }
 
 type fakeBulkQuotes struct {
-	calls int
-	date  string
+	calls  int
+	date   string
+	dates  []string
+	empty  map[string]bool
+	errors map[string]error
 }
 
 func (f *fakeBulkQuotes) FetchDaily(_ context.Context, symbol, date string) (schema.DailyQuoteRecord, error) {
@@ -49,6 +52,13 @@ func (f *fakeBulkQuotes) FetchDaily(_ context.Context, symbol, date string) (sch
 func (f *fakeBulkQuotes) FetchDailyBulk(_ context.Context, symbols []string, date string) (map[string]schema.DailyQuoteRecord, map[string]error, error) {
 	f.calls++
 	f.date = date
+	f.dates = append(f.dates, date)
+	if err := f.errors[date]; err != nil {
+		return nil, nil, err
+	}
+	if f.empty[date] {
+		return map[string]schema.DailyQuoteRecord{}, map[string]error{}, nil
+	}
 	records := make(map[string]schema.DailyQuoteRecord, len(symbols))
 	for _, symbol := range symbols {
 		records[symbol] = schema.DailyQuoteRecord{Symbol: symbol, Date: date, Open: 10, High: 12, Low: 9, Close: 11, AdjClose: 11, Volume: 100, Source: "massive", UpdatedAt: "2026-06-01T00:00:00Z"}
@@ -163,6 +173,66 @@ func TestSyncerRunUsesDailyBulkSource(t *testing.T) {
 	}
 	if quotes.calls != 1 || quotes.date != "2026-05-31" {
 		t.Fatalf("expected one bulk fetch for target date, calls=%d date=%s", quotes.calls, quotes.date)
+	}
+}
+
+func TestSyncerRunWithoutDateUsesLatestClosedMarketDate(t *testing.T) {
+	root := t.TempDir()
+	quotes := &fakeBulkQuotes{}
+	syncer := Syncer{
+		Store:   local.New(root),
+		Symbols: fakeSymbols{},
+		Quotes:  quotes,
+		Clock:   func() time.Time { return time.Date(2026, 6, 5, 18, 0, 0, 0, time.UTC) }, // Friday 14:00 New York.
+	}
+	if err := syncer.Run(context.Background(), SyncOptions{Market: "us"}); err != nil {
+		t.Fatal(err)
+	}
+	if quotes.date != "2026-06-04" {
+		t.Fatalf("expected previous closed trading date, got %s", quotes.date)
+	}
+	if exists, err := syncer.Store.Exists(context.Background(), storage.DailyKey("us", "2026-06-04")); err != nil || !exists {
+		t.Fatalf("expected daily file for 2026-06-04, exists=%v err=%v", exists, err)
+	}
+}
+
+func TestSyncerRunWithoutDateSkipsWeekend(t *testing.T) {
+	root := t.TempDir()
+	quotes := &fakeBulkQuotes{}
+	syncer := Syncer{
+		Store:   local.New(root),
+		Symbols: fakeSymbols{},
+		Quotes:  quotes,
+		Clock:   func() time.Time { return time.Date(2026, 6, 6, 15, 0, 0, 0, time.UTC) }, // Saturday.
+	}
+	if err := syncer.Run(context.Background(), SyncOptions{Market: "us"}); err != nil {
+		t.Fatal(err)
+	}
+	if quotes.date != "2026-06-05" {
+		t.Fatalf("expected Friday trading date, got %s", quotes.date)
+	}
+}
+
+func TestSyncerRunWithoutDateFallsBackToPreviousAvailableTradingDate(t *testing.T) {
+	root := t.TempDir()
+	quotes := &fakeBulkQuotes{empty: map[string]bool{"2026-06-05": true}}
+	syncer := Syncer{
+		Store:   local.New(root),
+		Symbols: fakeSymbols{},
+		Quotes:  quotes,
+		Clock:   func() time.Time { return time.Date(2026, 6, 6, 15, 0, 0, 0, time.UTC) },
+	}
+	if err := syncer.Run(context.Background(), SyncOptions{Market: "us"}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"2026-06-05", "2026-06-04"}
+	if len(quotes.dates) != len(want) {
+		t.Fatalf("unexpected date attempts: got %v want %v", quotes.dates, want)
+	}
+	for i := range want {
+		if quotes.dates[i] != want[i] {
+			t.Fatalf("unexpected date attempts: got %v want %v", quotes.dates, want)
+		}
 	}
 }
 

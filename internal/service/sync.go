@@ -70,7 +70,7 @@ func (s Syncer) Run(ctx context.Context, opt SyncOptions) error {
 	}
 	dateExplicit := opt.Date != ""
 	if opt.Date == "" {
-		opt.Date = defaultMarketDate(s.now())
+		opt.Date = latestClosedMarketDate(s.now())
 	}
 	if err := normalize.RequireDate(opt.Date); err != nil {
 		return err
@@ -135,18 +135,24 @@ func (s Syncer) Run(ctx context.Context, opt SyncOptions) error {
 	universeMap := normalize.UniverseMap(symbols)
 	var records []schema.DailyQuoteRecord
 	var failedTargets []string
-	logf("fetching daily quotes targets=%d date=%s", len(targets), opt.Date)
-	fetched, fetchFailures, err := s.fetchDailyRecords(ctx, targets, opt.Date, dateExplicit)
-	if err != nil {
-		return finish("failed", err)
-	}
-	logf("fetched daily quotes records=%d fetchFailures=%d", len(fetched), len(fetchFailures))
-	if !dateExplicit {
-		if inferred, ok := inferDailyDate(fetched); ok {
-			opt.Date = inferred
-			run.Date = inferred
-			logf("inferred daily date=%s", opt.Date)
+	var fetched map[string]schema.DailyQuoteRecord
+	var fetchFailures map[string]error
+	if dateExplicit {
+		logf("fetching daily quotes targets=%d date=%s", len(targets), opt.Date)
+		fetched, fetchFailures, err = s.fetchDailyRecords(ctx, targets, opt.Date, true)
+		if err != nil {
+			return finish("failed", err)
 		}
+		logf("fetched daily quotes records=%d fetchFailures=%d", len(fetched), len(fetchFailures))
+	} else {
+		logf("resolving latest closed trading date start=%s targets=%d", opt.Date, len(targets))
+		opt.Date, fetched, fetchFailures, err = s.fetchLatestClosedDailyRecords(ctx, targets, opt.Date, logf)
+		if err != nil {
+			return finish("failed", err)
+		}
+		run.Date = opt.Date
+		run.ID = opt.Market + "-" + opt.Date + "-" + s.now().Format("150405")
+		logf("selected latest closed trading date=%s records=%d fetchFailures=%d", opt.Date, len(fetched), len(fetchFailures))
 	}
 	universe := schema.SymbolUniverse{Date: opt.Date, Market: strings.ToUpper(opt.Market), Source: "nasdaqtrader", Symbols: symbols}
 	logf("writing symbol snapshots")
@@ -275,6 +281,28 @@ func (s Syncer) fetchDailyRecords(ctx context.Context, targets []string, date st
 	return fetched, failures, nil
 }
 
+func (s Syncer) fetchLatestClosedDailyRecords(ctx context.Context, targets []string, startDate string, logf func(string, ...any)) (string, map[string]schema.DailyQuoteRecord, map[string]error, error) {
+	const maxTradingDateAttempts = 10
+	date := startDate
+	var lastErr error
+	for attempt := 1; attempt <= maxTradingDateAttempts; attempt++ {
+		logf("trying trading date candidate=%s attempt=%d/%d", date, attempt, maxTradingDateAttempts)
+		fetched, failures, err := s.fetchDailyRecords(ctx, targets, date, true)
+		if err == nil && len(fetched) > 0 {
+			return date, fetched, failures, nil
+		}
+		if err != nil {
+			lastErr = err
+			logf("trading date candidate=%s unavailable: %v", date, err)
+		} else {
+			lastErr = fmt.Errorf("no records returned")
+			logf("trading date candidate=%s returned no records", date)
+		}
+		date = previousWeekday(date)
+	}
+	return "", nil, nil, fmt.Errorf("no daily records found in recent closed trading date candidates starting at %s: %w", startDate, lastErr)
+}
+
 func inferDailyDate(records map[string]schema.DailyQuoteRecord) (string, bool) {
 	counts := map[string]int{}
 	bestDate := ""
@@ -289,12 +317,33 @@ func inferDailyDate(records map[string]schema.DailyQuoteRecord) (string, bool) {
 	return bestDate, bestDate != ""
 }
 
-func defaultMarketDate(now time.Time) string {
+func latestClosedMarketDate(now time.Time) string {
 	loc, err := time.LoadLocation("America/New_York")
 	if err != nil {
-		return now.UTC().Format("2006-01-02")
+		return previousOrSameWeekday(now.UTC()).Format("2006-01-02")
 	}
-	return now.In(loc).Format("2006-01-02")
+	ny := now.In(loc)
+	closeTime := time.Date(ny.Year(), ny.Month(), ny.Day(), 16, 0, 0, 0, loc)
+	if ny.Before(closeTime) {
+		ny = ny.AddDate(0, 0, -1)
+	}
+	return previousOrSameWeekday(ny).Format("2006-01-02")
+}
+
+func previousOrSameWeekday(t time.Time) time.Time {
+	for t.Weekday() == time.Saturday || t.Weekday() == time.Sunday {
+		t = t.AddDate(0, 0, -1)
+	}
+	return t
+}
+
+func previousWeekday(date string) string {
+	t, err := time.Parse("2006-01-02", date)
+	if err != nil {
+		return date
+	}
+	t = t.AddDate(0, 0, -1)
+	return previousOrSameWeekday(t).Format("2006-01-02")
 }
 
 func (s Syncer) updateHistories(ctx context.Context, market string, records []schema.DailyQuoteRecord, workers int, logf func(string, ...any)) error {

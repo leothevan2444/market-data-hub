@@ -155,7 +155,7 @@ There are three data-producing flows:
 
 Daily sync is the normal weekday update path. It loads the Nasdaq Trader symbol universe, targets the full active universe by default, or targets only `--watchlist` symbols when a watchlist path is provided. It fetches EOD quotes from Massive, validates and normalizes records, writes or overwrites the daily file for that date, merges those records into each symbol history file with configurable parallel workers, rebuilds `latest`, updates D1, and writes a run log. The CLI prints progress logs to stderr, including target counts, fetch/validation counts, object write phases, D1 update phases, and symbol-history progress every 1,000 records.
 
-If `--date` is omitted, daily sync uses the latest date returned by the data source. If `--date` is provided, records that do not match that date are treated as failed. Re-running daily sync for an existing date overwrites that date's daily file and updates derived latest/history/run objects; symbol histories replace records with the same date instead of appending duplicates.
+If `--date` is omitted, daily sync starts from the latest market date that should be closed in `America/New_York` time, then walks backward through weekdays until Massive returns daily records. This handles before-close manual runs, weekends, and market holidays. If `--date` is provided, only that date is fetched. Re-running daily sync for an existing date overwrites that date's daily file and updates derived latest/history/run objects; symbol histories replace records with the same date instead of appending duplicates.
 
 Historical backfill is the large dataset construction path. It downloads the Stooq US daily archive (`https://static.stooq.com/db/h/{STOOQ_API_KEY}/d_us_txt.zip` when `STOOQ_API_KEY` is set), filters it to the requested target symbols and optional `--from`/`--to` range, then writes:
 
@@ -321,7 +321,7 @@ CLOUDFLARE_API_TOKEN=...
 D1_DATABASE_ID=...
 ```
 
-The production wrapper does not pass `--date`, so the syncer uses the latest date returned by the data source. This avoids failures caused by scheduler delays crossing midnight. It also does not pass `--watchlist`, so the daily VPS sync targets the full active US universe.
+The production wrapper does not pass `--date`, so the syncer automatically resolves the latest closed trading date with available Massive records. This avoids failures caused by scheduler delays crossing midnight, weekends, and market holidays. It also does not pass `--watchlist`, so the daily VPS sync targets the full active US universe.
 
 Check the timer:
 

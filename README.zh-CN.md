@@ -155,7 +155,7 @@ D1 是派生查询索引，不是数据源事实表。它存储：
 
 Daily sync 是常规工作日更新路径。它加载 Nasdaq Trader symbol universe，默认同步完整 active universe；如果提供 `--watchlist`，则只同步 watchlist 中的 symbols。它从 Massive 获取 EOD quotes，校验并规范化 records，写入或覆盖该日期的 daily 文件，用可配置的并行 workers 合并到每个 symbol history，重建 `latest`，更新 D1，并写入 run log。CLI 会把进度日志输出到 stderr，包括 target counts、fetch/validation counts、object write phases、D1 update phases，以及每 1,000 条的 symbol-history progress。
 
-如果省略 `--date`，daily sync 会使用数据源返回的最新日期。如果提供 `--date`，不匹配该日期的 records 会被视为失败。对已有日期重新运行 daily sync 会覆盖该日期的 daily 文件，并更新派生的 latest/history/run objects；symbol histories 会替换相同日期的 records，不会重复追加。
+如果省略 `--date`，daily sync 会先从 `America/New_York` 时区下理论上已经收市的最新市场日期开始，然后按工作日向前查找，直到 Massive 返回 daily records。这样可以处理盘中手动运行、周末和市场节假日。如果提供 `--date`，则只获取该日期。对已有日期重新运行 daily sync 会覆盖该日期的 daily 文件，并更新派生的 latest/history/run objects；symbol histories 会替换相同日期的 records，不会重复追加。
 
 Historical backfill 是大规模历史数据构建路径。它会下载 Stooq US daily archive（设置 `STOOQ_API_KEY` 时使用 `https://static.stooq.com/db/h/{STOOQ_API_KEY}/d_us_txt.zip`），按目标 symbols 和可选 `--from`/`--to` 范围过滤，然后写入：
 
@@ -321,7 +321,7 @@ CLOUDFLARE_API_TOKEN=...
 D1_DATABASE_ID=...
 ```
 
-生产 wrapper 不传 `--date`，因此 syncer 会使用数据源返回的最新日期。这可以避免 scheduler delay 跨过 midnight 导致的失败。它也不传 `--watchlist`，因此 VPS daily sync 目标是完整 active US universe。
+生产 wrapper 不传 `--date`，因此 syncer 会自动解析 Massive 有可用记录的最近已收市交易日。这可以避免 scheduler delay 跨过 midnight、周末和市场节假日导致的失败。它也不传 `--watchlist`，因此 VPS daily sync 目标是完整 active US universe。
 
 检查 timer：
 
