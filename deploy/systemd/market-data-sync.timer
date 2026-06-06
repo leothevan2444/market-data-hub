@@ -1,8 +1,8 @@
 [Unit]
-Description=Run Market Data Hub daily EOD sync after US market close
+Description=Run Market Data Hub daily EOD sync after Massive free-plan data is available
 
 [Timer]
-OnCalendar=Mon..Fri *-*-* 19:30:00 America/New_York
+OnCalendar=Tue..Sat *-*-* 00:30:00 America/New_York
 Persistent=true
 AccuracySec=1min
 RandomizedDelaySec=2min

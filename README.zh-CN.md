@@ -354,10 +354,10 @@ journalctl -u market-data-sync.service -n 100 --no-pager
 ./scripts/uninstall.sh --purge-env
 ```
 
-Timer 配置为：
+Timer 配置为美东下一个市场日凌晨运行，以便 Massive free plan 能获取前一交易日数据：
 
 ```text
-Mon..Fri 19:30 America/New_York
+Tue..Sat 00:30 America/New_York
 ```
 
 `Persistent=true` 会让 systemd 在 VPS 恢复在线后补跑错过的 sync。Wrapper script 使用文件锁，因此重叠的 sync attempts 会被跳过，而不是并发运行。

@@ -354,10 +354,10 @@ The uninstall script keeps `/etc/market-data-hub/env` by default because it cont
 ./scripts/uninstall.sh --purge-env
 ```
 
-The timer is configured as:
+The timer is configured to run after midnight on the next US market day so Massive free-plan data for the previous session is available:
 
 ```text
-Mon..Fri 19:30 America/New_York
+Tue..Sat 00:30 America/New_York
 ```
 
 `Persistent=true` lets systemd run a missed sync after the VPS comes back online. The wrapper script uses a file lock so overlapping sync attempts are skipped instead of running concurrently.
